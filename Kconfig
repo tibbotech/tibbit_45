@@ -1,0 +1,171 @@
+menu "TB45 Application Options"
+
+config TIBBIT_45
+    bool "Enable Tibbit 45 library"
+    default y
+    help
+      Enable the Tibbit 45 cellular modem library and related drivers.
+
+config APP_TB45_SHOW_AVAILABLE_COMMANDS_MENU
+    bool "Show TB45 available commands banner at startup"
+    default y
+    help
+      Print the TB45 "Available commands" menu during startup finalization.
+      Set this to n to keep startup output minimal.
+
+config APP_TB45_PPP_CHECK_WARN_LOGS
+    bool "Enable TB45 checkpoint warning logs"
+    default y
+    help
+      Control LOG_WRN output for startup checkpoint progress messages.
+      Set to n to silence checkpoint warning logs while keeping checkpoint logic active.
+
+config APP_TB45_SIM_PIN_ENABLE
+    bool "Enable SIM PIN unlock command during modem init"
+    default n
+    help
+      Send AT+CPIN with a configured PIN during SIM7080 init.
+      Keep disabled for SIM cards that do not require PIN unlock.
+
+config APP_TB45_SIM_PIN
+    string "SIM PIN value"
+    default "0000"
+    depends on APP_TB45_SIM_PIN_ENABLE
+    help
+      SIM PIN used by AT+CPIN during modem initialization.
+      Valid SIM PIN length is usually 4 to 8 digits.
+
+config APP_TB45_MODEM_APN
+    string "Custom modem APN (out-of-tree modem driver)"
+    default "internet"
+    help
+      APN used by the out-of-tree modem cellular custom driver.
+      This maps to CONFIG_MODEM_CELLULAR_APN behavior when the built-in
+      MODEM_CELLULAR Kconfig path is not active.
+
+config APP_TB45_MODEM_BRINGUP_MAX_RETRIES
+    int "Custom modem bring-up max retries (out-of-tree modem driver)"
+    default 30
+    range 0 10000
+    help
+      Maximum bring-up retries for the custom modem driver.
+      Set to 0 for infinite retries.
+      This maps to CONFIG_MODEM_CELLULAR_BRINGUP_MAX_RETRIES behavior.
+
+config APP_TB45_MODEM_NEW_BAUDRATE
+    int "Custom modem new baudrate (out-of-tree modem driver)"
+    default 115200
+    range 9600 4000000
+    help
+      Target UART baudrate used by the custom modem driver where applicable.
+      This maps to CONFIG_MODEM_CELLULAR_NEW_BAUDRATE behavior.
+
+config APP_TB45_MODEM_UART_BUFFER_SIZES
+    int "Custom modem UART RX/TX buffer size (out-of-tree modem driver)"
+    default 512
+    range 64 4096
+    help
+      UART backend receive/transmit buffer size used by the custom modem driver.
+      This maps to CONFIG_MODEM_CELLULAR_UART_BUFFER_SIZES behavior.
+
+config APP_TB45_MODEM_CHAT_BUFFER_SIZE
+    int "Custom modem chat buffer size (out-of-tree modem driver)"
+    default 128
+    range 32 1024
+    help
+      Chat parser receive buffer size used by the custom modem driver.
+      This maps to CONFIG_MODEM_CELLULAR_CHAT_BUFFER_SIZE behavior.
+
+config APP_TB45_MODEM_USER_PIPE_BUFFER_SIZES
+    int "Custom modem user pipe buffer size (out-of-tree modem driver)"
+    default 128
+    range 32 1024
+    help
+      User pipe receive buffer size used by the custom modem driver.
+      This maps to CONFIG_MODEM_CELLULAR_USER_PIPE_BUFFER_SIZES behavior.
+
+config APP_TB45_MODEM_INIT_PRIORITY
+    int "Custom modem init priority (out-of-tree modem driver)"
+    default 79
+    range 0 999
+    help
+      Initialization priority used by the custom modem driver.
+      This maps to CONFIG_MODEM_CELLULAR_INIT_PRIORITY behavior.
+
+config APP_TB45_MODEM_NEW_BAUDRATE_DELAY
+    int "Custom modem baudrate switch delay in ms (out-of-tree modem driver)"
+    default 300
+    range 0 60000
+    help
+      Delay after baudrate change command in milliseconds.
+      This maps to CONFIG_MODEM_CELLULAR_NEW_BAUDRATE_DELAY behavior.
+
+config APP_TB45_MODEM_RESET_POWER_ON_DELAY_MS
+    int "Custom modem reset-to-power-on delay in ms (out-of-tree modem driver)"
+    default 500
+    range 0 60000
+    help
+      Delay between reset and power-on phases in milliseconds.
+      This maps to CONFIG_MODEM_CELLULAR_RESET_POWER_ON_DELAY_MS behavior.
+
+config APP_TB45_MODEM_PERIODIC_SCRIPT_MS
+    int "Custom modem periodic script interval in ms (out-of-tree modem driver)"
+    default 10000
+    range 100 600000
+    help
+      Periodic script interval used by modem bring-up/health checks.
+      This maps to CONFIG_MODEM_CELLULAR_PERIODIC_SCRIPT_MS behavior.
+
+config APP_TB45_PING_COUNT_DEFAULT
+    int "Default ping count for tb45 net ping"
+    default 4
+    range 1 100
+    help
+      Default ICMP echo request count used when count is omitted.
+
+config APP_TB45_GOOGLE_DNS_IPV4
+    string "IPv4 target used by runtime internet probe"
+    default "8.8.8.8"
+    help
+      IPv4 address used by runtime internet reachability probe
+      (for example in tb45 show ppp_info).
+
+config APP_TB45_PPP_CHECK_INTERNET_REACHABILITY_DNS_HOST
+    string "DNS host used by startup internet reachability check"
+    default "google.com"
+    help
+      Hostname resolved during startup internet reachability check.
+
+config APP_TB45_PPP_CHECK_INTERNET_REACHABILITY_TCP_PORT_STR
+    string "TCP port used by startup internet reachability check"
+    default "443"
+    help
+      TCP service port string used with DNS host during startup
+      internet reachability validation.
+
+config APP_TB45_PPP_PERIODIC_HEALTH_INTERVAL_MS
+    int "Periodic PPP internet health check interval in ms (0 to disable)"
+    default 30000
+    range 0 3600000
+    help
+      Interval for periodic internet health checks after startup finalization.
+      This reuses the same DNS+TCP probe as the boot-time reachability check.
+      Set to 0 to disable periodic checks.
+
+config APP_TB45_PPP_PERIODIC_RECOVERY_COOLDOWN_MS
+    int "Cooldown before periodic PPP health can trigger another recovery (ms)"
+    default 60000
+    range 0 3600000
+    help
+      Minimum time between consecutive periodic health-triggered recoveries.
+      Set to 0 to allow immediate retriggering on repeated failures.
+
+config APP_TB45_SMS_TEXT_MAX_LEN
+    int "Maximum SMS text length"
+    default 160
+    range 1 1600
+    help
+      Maximum number of characters allowed in an SMS message.
+      Note: Values over 160 may require concatenation or different encoding.
+
+endmenu
