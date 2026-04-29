@@ -107,7 +107,60 @@ int modem_cellular_custom_trigger_ppp_check_route_ready_restart(const struct dev
 int modem_cellular_custom_submit_sim_puk_unlock(const struct device *dev, const char *puk,
                                                 const char *new_pin);
 int modem_cellular_custom_get_current_network_mode_code(const struct device *dev, int *mode_code);
-extern const char *tb45_main_get_cellapn(void) __attribute__((weak));
+
+/*
+ * Runtime cellular configuration owned by this library. Populated by
+ * tb45_cellular_init() (typically called from main()). The four
+ * tb45_main_get_cell* symbols below satisfy the weak-extern contract that the
+ * modem_cellular_custom driver still uses to fetch APN/PIN/etc at runtime.
+ */
+#define TB45_CELL_FIELD_MAX 64
+static char tb45_cell_apn[TB45_CELL_FIELD_MAX];
+static char tb45_cell_username[TB45_CELL_FIELD_MAX];
+static char tb45_cell_password[TB45_CELL_FIELD_MAX];
+static char tb45_cell_sim_pin[TB45_CELL_FIELD_MAX];
+static bool tb45_cell_apn_set;
+static bool tb45_cell_username_set;
+static bool tb45_cell_password_set;
+static bool tb45_cell_sim_pin_set;
+
+static void tb45_cell_store_field(char *dst, size_t dst_size, bool *set_flag,
+                                  const char *src)
+{
+    if (src == NULL) {
+        dst[0] = '\0';
+        *set_flag = false;
+        return;
+    }
+
+    size_t copy_len = strlen(src);
+    if (copy_len >= dst_size) {
+        copy_len = dst_size - 1U;
+    }
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+    *set_flag = true;
+}
+
+const char *tb45_main_get_cellapn(void)
+{
+    return tb45_cell_apn_set ? tb45_cell_apn : NULL;
+}
+
+const char *tb45_main_get_cellun(void)
+{
+    return tb45_cell_username_set ? tb45_cell_username : NULL;
+}
+
+const char *tb45_main_get_cellpw(void)
+{
+    return tb45_cell_password_set ? tb45_cell_password : NULL;
+}
+
+const char *tb45_main_get_cellpin(void)
+{
+    return tb45_cell_sim_pin_set ? tb45_cell_sim_pin : NULL;
+}
 
 static void tb45_startup_finalize_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(tb45_startup_finalize_work, tb45_startup_finalize_work_handler);
@@ -195,31 +248,22 @@ static const struct tb45_periodic_http_target tb45_periodic_http_targets[] = {
     },
 };
 
-static const char *tb45_get_runtime_cellapn(void)
-{
-    if (tb45_main_get_cellapn == NULL) {
-        return NULL;
-    }
-
-    return tb45_main_get_cellapn();
-}
-
 static void tb45_log_startup_apn_hint(void)
 {
-    const char *apn = tb45_get_runtime_cellapn();
+    const char *apn = tb45_main_get_cellapn();
 
     if (apn == NULL) {
-        LOG_WRN("TB45 startup hint: CELLAPN is not present in app/src/main.cpp");
+        LOG_WRN("TB45 startup hint: APN not provided to tb45_cellular_init()");
         return;
     }
 
     if (apn[0] == '\0') {
-        LOG_WRN("TB45 startup hint: CELLAPN is present but empty");
+        LOG_WRN("TB45 startup hint: APN provided to tb45_cellular_init() is empty");
         return;
     }
 
-    LOG_ERR("TB45 startup hint: verify CELLAPN is correct for your SIM/operator");
-    LOG_ERR("TB45 startup hint: current CELLAPN=\"%s\"", apn);
+    LOG_ERR("TB45 startup hint: verify APN is correct for your SIM/operator");
+    LOG_ERR("TB45 startup hint: current APN=\"%s\"", apn);
 
 }
 /*
@@ -1026,8 +1070,19 @@ static void tb45_cellular_startup_init_runtime(const struct device *uart_dev)
     LOG_DBG("TB45 startup: waiting for modem-ready event before showing shell command menu");
 }
 
-static int tb45_cellular_startup_init(void)
+int tb45_cellular_init(const struct tb45_cellular_config *cfg)
 {
+    if (cfg != NULL) {
+        tb45_cell_store_field(tb45_cell_apn, sizeof(tb45_cell_apn),
+                              &tb45_cell_apn_set, cfg->apn);
+        tb45_cell_store_field(tb45_cell_username, sizeof(tb45_cell_username),
+                              &tb45_cell_username_set, cfg->username);
+        tb45_cell_store_field(tb45_cell_password, sizeof(tb45_cell_password),
+                              &tb45_cell_password_set, cfg->password);
+        tb45_cell_store_field(tb45_cell_sim_pin, sizeof(tb45_cell_sim_pin),
+                              &tb45_cell_sim_pin_set, cfg->sim_pin);
+    }
+
     const struct device *uart_dev = NULL;
 
     if (tb45_modem_uart_dev != NULL) {
@@ -1040,8 +1095,6 @@ static int tb45_cellular_startup_init(void)
     tb45_cellular_startup_init_runtime(uart_dev);
     return 0;
 }
-
-SYS_INIT(tb45_cellular_startup_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
 #ifdef CONFIG_SHELL
 static int tb45_cellular_dev_check(const struct shell *shell)
