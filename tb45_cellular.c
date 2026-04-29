@@ -1822,6 +1822,8 @@ static int tb45_get_ppp_iface(const struct shell *shell, struct net_if **iface_o
     return 0;
 }
 
+#endif /* CONFIG_SHELL */
+
 static bool tb45_ppp_iface_has_ipv4_addr(struct net_if *iface)
 {
     if ((iface == NULL) || (iface->config.ip.ipv4 == NULL)) {
@@ -2032,6 +2034,8 @@ static bool tb45_ppp_is_healthy_reachable(void)
     TB45_PERIODIC_HTTP_LOG_DBG("TB45 periodic: precheck passed; running HTTP fallback probe");
     return tb45_periodic_http_probe_with_fallback();
 }
+
+#ifdef CONFIG_SHELL
 
 static int tb45_wait_for_pm_state(const struct shell *shell, enum pm_device_state expected_state,
                                   int timeout_ms, const char *step_name)
@@ -2671,6 +2675,8 @@ static int cmd_tb45_ping(const struct shell *shell, size_t argc, char **argv)
     return 0;
 }
 
+#endif /* CONFIG_SHELL */
+
 static bool tb45_startup_ppp_check_internet_reachability_probe_with_http_fallback(void)
 {
     LOG_DBG("TB45 startup: ppp_check_internet_reachability running HTTP request fallback probe");
@@ -2684,6 +2690,8 @@ static bool tb45_startup_ppp_check_internet_reachability_probe_with_http_fallbac
 
     return ok;
 }
+
+#ifdef CONFIG_SHELL
 
 SHELL_STATIC_SUBCMD_SET_CREATE(tb45_cell_cmds,
     SHELL_CMD(resume, NULL, "Resume modem_cellular state machine", cmd_tb45_cell_resume),
