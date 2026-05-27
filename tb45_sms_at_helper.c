@@ -1,6 +1,7 @@
 #include "tb45_sms_at_helper.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -375,8 +376,8 @@ static int tb45_sms_pipe_send_line(struct modem_pipe *pipe, const char *line, in
 	return tb45_sms_pipe_transmit_all(pipe, &cr, 1U, timeout_ms);
 }
 
-static int tb45_sms_pipe_wait_for_ok(struct modem_pipe *pipe, const char *required_token,
-				     int timeout_ms)
+static int tb45_sms_pipe_wait_for_ok_capture(struct modem_pipe *pipe, const char *required_token,
+					     int timeout_ms, char *out_buf, size_t out_buf_size)
 {
 	int ret;
 	int64_t deadline_ms;
@@ -398,6 +399,12 @@ static int tb45_sms_pipe_wait_for_ok(struct modem_pipe *pipe, const char *requir
 		}
 
 		tb45_sms_at_buf_append(rx_buf, sizeof(rx_buf), &rx_len, chunk, (size_t)ret);
+		if ((out_buf != NULL) && (out_buf_size > 1U)) {
+			size_t out_len = strlen(out_buf);
+			tb45_sms_at_buf_append((uint8_t *)out_buf, out_buf_size - 1U, &out_len, chunk,
+					       (size_t)ret);
+			out_buf[out_len] = '\0';
+		}
 
 		if (tb45_sms_at_has_error(rx_buf, rx_len)) {
 			return -EIO;
@@ -413,6 +420,12 @@ static int tb45_sms_pipe_wait_for_ok(struct modem_pipe *pipe, const char *requir
 	}
 
 	return -ETIMEDOUT;
+}
+
+static int tb45_sms_pipe_wait_for_ok(struct modem_pipe *pipe, const char *required_token,
+				     int timeout_ms)
+{
+	return tb45_sms_pipe_wait_for_ok_capture(pipe, required_token, timeout_ms, NULL, 0U);
 }
 
 static int tb45_sms_pipe_wait_for_prompt(struct modem_pipe *pipe, int timeout_ms)
@@ -576,7 +589,8 @@ int tb45_sms_at_send_text_raw(const struct shell *sh, const char *cmgs_cmd, cons
 		goto out;
 	}
 
-	ret = tb45_sms_pipe_send_line(pipe, "AT+CSCS=\"GSM\"", TB45_SMS_AT_SETUP_TIMEOUT_MS);
+	/* Use IRA so ASCII characters (e.g. '_') are preserved in SMS text mode. */
+	ret = tb45_sms_pipe_send_line(pipe, "AT+CSCS=\"IRA\"", TB45_SMS_AT_SETUP_TIMEOUT_MS);
 	if (ret < 0) {
 		goto out;
 	}
@@ -633,19 +647,111 @@ out:
 	return ret;
 }
 
+int tb45_sms_at_exec_capture(const char *request, char *out_buf, size_t out_buf_size, int timeout_ms)
+{
+	int ret;
+	int attach_ret = 0;
+	struct modem_pipe *pipe;
+
+	if ((request == NULL) || (timeout_ms < TB45_SMS_AT_MIN_TIMEOUT_MS) ||
+	    (timeout_ms > TB45_SMS_AT_MAX_TIMEOUT_MS)) {
+		return -EINVAL;
+	}
+
+	if ((out_buf != NULL) && (out_buf_size > 0U)) {
+		out_buf[0] = '\0';
+	}
+
+	pipe = modem_pipelink_get_pipe(tb45_sms_at_pipelink);
+	if (pipe == NULL) {
+		return -ENODEV;
+	}
+
+	ret = modem_at_user_pipe_claim();
+	if (ret < 0) {
+		return ret;
+	}
+
+	modem_chat_release(&tb45_sms_at_chat);
+
+	ret = modem_pipe_open_async(pipe);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = tb45_sms_pipe_drain_rx(pipe);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = tb45_sms_pipe_send_line(pipe, request, timeout_ms);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = tb45_sms_pipe_wait_for_ok_capture(pipe, NULL, timeout_ms, out_buf, out_buf_size);
+
+out:
+	attach_ret = modem_chat_attach(&tb45_sms_at_chat, pipe);
+	if ((attach_ret < 0) && (ret == 0)) {
+		ret = attach_ret;
+	}
+
+	modem_at_user_pipe_release();
+	return ret;
+}
+
 #ifdef CONFIG_SHELL
 static int cmd_tb45_modem_at(const struct shell *sh, size_t argc, char **argv)
 {
-	ARG_UNUSED(argc);
+	const char *expected = "OK";
+	int timeout_ms = TB45_SMS_AT_DEFAULT_TIMEOUT_MS;
+	char *endptr = NULL;
+	long parsed_timeout;
 
-	return tb45_sms_at_run(sh, argv[1], (argc >= 3) ? argv[2] : "OK",
-			       TB45_SMS_AT_DEFAULT_TIMEOUT_MS);
+	if (argc >= 3) {
+		parsed_timeout = strtol(argv[2], &endptr, 10);
+		if ((endptr != NULL) && (*argv[2] != '\0') && (*endptr == '\0')) {
+			if ((parsed_timeout < TB45_SMS_AT_MIN_TIMEOUT_MS) ||
+			    (parsed_timeout > TB45_SMS_AT_MAX_TIMEOUT_MS)) {
+				shell_error(sh, "timeout_ms must be %d..%d",
+					    TB45_SMS_AT_MIN_TIMEOUT_MS,
+					    TB45_SMS_AT_MAX_TIMEOUT_MS);
+				return -EINVAL;
+			}
+
+			timeout_ms = (int)parsed_timeout;
+		} else {
+			expected = argv[2];
+		}
+	}
+
+	if (argc >= 4) {
+		parsed_timeout = strtol(argv[3], &endptr, 10);
+		if ((endptr == NULL) || (*argv[3] == '\0') || (*endptr != '\0')) {
+			shell_error(sh, "invalid timeout_ms: %s", argv[3]);
+			return -EINVAL;
+		}
+
+		if ((parsed_timeout < TB45_SMS_AT_MIN_TIMEOUT_MS) ||
+		    (parsed_timeout > TB45_SMS_AT_MAX_TIMEOUT_MS)) {
+			shell_error(sh, "timeout_ms must be %d..%d",
+				    TB45_SMS_AT_MIN_TIMEOUT_MS,
+				    TB45_SMS_AT_MAX_TIMEOUT_MS);
+			return -EINVAL;
+		}
+
+		timeout_ms = (int)parsed_timeout;
+	}
+
+	return tb45_sms_at_run(sh, argv[1], expected, timeout_ms);
 }
 
 SHELL_STATIC_SUBCMD_SET_CREATE(tb45_modem_cmds,
 	SHELL_CMD_ARG(at, NULL,
-		      SHELL_HELP("Send AT command", "<command> [expected_response]"),
-		      cmd_tb45_modem_at, 2, 1),
+		      SHELL_HELP("Send AT command",
+			 "<command> [expected_response|timeout_ms] [timeout_ms]"),
+		      cmd_tb45_modem_at, 2, 2),
 	SHELL_SUBCMD_SET_END
 );
 

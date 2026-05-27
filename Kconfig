@@ -123,33 +123,112 @@ config APP_TB45_PING_COUNT_DEFAULT
     help
       Default ICMP echo request count used when count is omitted.
 
-config APP_TB45_GOOGLE_DNS_IPV4
+config APP_TB45_ASYNC_JOB_QUEUE_DEPTH
+    int "TB45 async job queue depth"
+    default 4
+    range 1 32
+    help
+      Number of jobs buffered by the shared TB45 async queue (SMS + PING).
+
+config APP_TB45_ASYNC_JOB_STACK_SIZE
+    int "TB45 async job worker stack size"
+    default 4096
+    range 1024 16384
+    help
+      Stack size for the shared TB45 async worker thread.
+
+config APP_TB45_ASYNC_JOB_PRIORITY
+    int "TB45 async job worker priority"
+    default 7
+    range -16 15
+    help
+      Zephyr thread priority for the shared TB45 async worker thread.
+
+config APP_TB45_ASYNC_SMS_JOB_EXTRA_RETRIES
+    int "Extra retries for async SMS jobs"
+    default 0
+    range 0 5
+    help
+      Additional dispatcher-level retries after the first SMS job attempt.
+
+config APP_TB45_ASYNC_SMS_JOB_RETRY_DELAY_MS
+    int "Retry delay for async SMS jobs (ms)"
+    default 1000
+    range 0 60000
+    help
+      Delay between dispatcher-level SMS job retry attempts.
+
+config APP_TB45_ASYNC_PING_JOB_EXTRA_RETRIES
+    int "Extra retries for async PING jobs"
+    default 0
+    range 0 5
+    help
+      Additional dispatcher-level retries after the first PING job attempt.
+
+config APP_TB45_ASYNC_PING_JOB_RETRY_DELAY_MS
+    int "Retry delay for async PING jobs (ms)"
+    default 1000
+    range 0 60000
+    help
+      Delay between dispatcher-level PING job retry attempts.
+
+config APP_TB45_ASYNC_PING_HOST_MAX_LEN
+    int "Maximum host string length for async PING jobs"
+    default 63
+    range 7 255
+    help
+      Maximum host string length accepted by tb45_ping_enqueue().
+
+config APP_TB45_ASYNC_PING_DEFAULT_COUNT
+    int "Default count for async PING jobs"
+    default 4
+    range 1 100
+    help
+      Default ICMP request count when tb45_ping_enqueue() receives count=0.
+
+config APP_TB45_ASYNC_PING_MAX_COUNT
+    int "Maximum count for async PING jobs"
+    default 20
+    range 1 1000
+    help
+      Upper bound for ICMP request count accepted by tb45_ping_enqueue().
+
+config APP_TB45_ASYNC_PING_DEFAULT_TIMEOUT_MS
+    int "Default timeout for async PING jobs (ms)"
+    default 2000
+    range 100 60000
+    help
+      Default per-request timeout when tb45_ping_enqueue() receives timeout_ms=0.
+
+config APP_TB45_ASYNC_PING_MIN_TIMEOUT_MS
+    int "Minimum timeout for async PING jobs (ms)"
+    default 100
+    range 10 60000
+    help
+      Lower bound for timeout accepted by tb45_ping_enqueue().
+
+config APP_TB45_ASYNC_PING_MAX_TIMEOUT_MS
+    int "Maximum timeout for async PING jobs (ms)"
+    default 10000
+    range 100 120000
+    help
+      Upper bound for timeout accepted by tb45_ping_enqueue().
+
+config APP_TB45_GOOGLE_IPV4
     string "IPv4 target used by runtime internet probe"
     default "8.8.8.8"
     help
       IPv4 address used by runtime internet reachability probe
       (for example in tb45 show ppp_info).
 
-config APP_TB45_PPP_CHECK_INTERNET_REACHABILITY_DNS_HOST
-    string "DNS host used by startup internet reachability check"
-    default "google.com"
-    help
-      Hostname resolved during startup internet reachability check.
-
-config APP_TB45_PPP_CHECK_INTERNET_REACHABILITY_TCP_PORT_STR
-    string "TCP port used by startup internet reachability check"
-    default "443"
-    help
-      TCP service port string used with DNS host during startup
-      internet reachability validation.
-
-config APP_TB45_PPP_PERIODIC_HEALTH_INTERVAL_MS
-    int "Periodic PPP internet health check interval in ms (0 to disable)"
+config APP_TB45_PPP_PERIODIC_PROBE_INTERVAL_MS
+    int "Periodic PPP internet probe interval in ms (0 to disable)"
     default 30000
     range 0 3600000
     help
-      Interval for periodic internet health checks after startup finalization.
-      This reuses the same DNS+TCP probe as the boot-time reachability check.
+      Interval for periodic internet probes after startup finalization.
+      This reuses the same ping probe used by the boot-time
+      reachability check.
       Set to 0 to disable periodic checks.
 
 config APP_TB45_PPP_PERIODIC_RECOVERY_COOLDOWN_MS
@@ -167,5 +246,160 @@ config APP_TB45_SMS_TEXT_MAX_LEN
     help
       Maximum number of characters allowed in an SMS message.
       Note: Values over 160 may require concatenation or different encoding.
+
+config APP_TB45_SMS_PHONE_MAX_LEN
+    int "Maximum SMS phone number length"
+    default 24
+    range 3 64
+    help
+      Maximum number of characters allowed in a destination phone number,
+      including an optional leading '+'.
+
+config APP_TB45_SMS_SEND_ATTEMPT_TIMEOUT_MS
+    int "SMS send attempt timeout in milliseconds"
+    default 90000
+    range 100 600000
+    help
+      Timeout for one SMS submit attempt after receiving the CMGS prompt.
+
+config APP_TB45_SMS_SEND_MAX_RETRIES
+    int "Maximum retries for SMS send"
+    default 3
+    range 0 20
+    help
+      Number of retries after a failed send attempt.
+      0 means a single attempt with no retries.
+
+config APP_TB45_SMS_SEND_RETRY_DELAY_MS
+    int "SMS retry delay in milliseconds"
+    default 3000
+    range 0 600000
+    help
+      Delay between SMS send retry attempts.
+
+config APP_TB45_SMS_INIT_WAIT_MS
+    int "Initial SMS init wait in milliseconds"
+    default 10000
+    range 0 600000
+    help
+      Delay after PPP down before issuing SMS init AT commands.
+
+config APP_TB45_SMS_INIT_AT_TIMEOUT_MS
+    int "SMS init AT command timeout in milliseconds"
+    default 10000
+    range 100 600000
+    help
+      Timeout used by AT commands during the SMS init sequence.
+
+config APP_TB45_SMS_RESULT_QUEUE_DEPTH
+    int "SMS async result queue depth"
+    default 16
+    range 1 128
+    help
+      Number of completed SMS results buffered for later retrieval by
+      request id or by wait/pop API.
+
+config APP_TB45_SMS_TRIGGER_EVENT_PATH
+    bool "Enable SMS serial EVENT trigger path"
+    default y
+    help
+      Enable serial receive event publication for SMS event callbacks.
+
+config APP_TB45_SMS_EVENT_QUEUE_DEPTH
+    int "SMS event queue depth"
+    default 16
+    range 1 128
+    help
+      Number of SMS events buffered before callback dispatch.
+
+config APP_TB45_SMS_EVENT_WORKER_STACK_SIZE
+    int "SMS event worker stack size"
+    default 2048
+    range 1024 8192
+    help
+      Stack size for SMS event dispatcher worker thread.
+
+config APP_TB45_SMS_EVENT_WORKER_PRIORITY
+    int "SMS event worker priority"
+    default 8
+    range -16 15
+    help
+      Priority for SMS event dispatcher worker thread.
+
+config APP_TB45_SMS_SERIAL_RX_DEBOUNCE_MS
+    int "SMS serial RX event debounce (ms)"
+    default 1000
+    range 0 60000
+    help
+      Minimum interval between published serial RX events.
+
+config APP_TB45_SMS_RESULT_WORKER_ENABLE
+    bool "Enable SMS final-result worker"
+    default y
+    help
+      Start a dedicated worker that consumes tb45_sms_result_wait() and
+      publishes final send result events.
+
+config APP_TB45_SMS_RESULT_WORKER_STACK_SIZE
+    int "SMS result worker stack size"
+    default 2048
+    range 1024 8192
+    depends on APP_TB45_SMS_RESULT_WORKER_ENABLE
+    help
+      Stack size for SMS result worker thread.
+
+config APP_TB45_SMS_RESULT_WORKER_PRIORITY
+    int "SMS result worker priority"
+    default 8
+    range -16 15
+    depends on APP_TB45_SMS_RESULT_WORKER_ENABLE
+    help
+      Priority for SMS result worker thread.
+
+config APP_TB45_SMS_RX_TRIGGER_QUEUE_DEPTH
+    int "SMS receive trigger queue depth"
+    default 8
+    range 1 64
+    help
+      Number of pending SMS receive triggers buffered from serial/CMTI events.
+
+config APP_TB45_SMS_RX_RESULT_QUEUE_DEPTH
+    int "SMS receive result queue depth"
+    default 16
+    range 1 128
+    help
+      Number of parsed inbound SMS messages buffered for tb45_sms_receive_wait().
+
+config APP_TB45_SMS_RX_WORKER_STACK_SIZE
+    int "SMS receive worker stack size"
+    default 3072
+    range 1024 8192
+    help
+      Stack size for SMS receive worker thread.
+
+config APP_TB45_SMS_RX_WORKER_PRIORITY
+    int "SMS receive worker priority"
+    default 8
+    range -16 15
+    help
+      Priority for SMS receive worker thread.
+
+config APP_TB45_SMS_RX_STORAGE
+    string "SMS receive storage memory (ME or SM)"
+    default "ME"
+    help
+      Storage target configured via AT+CPMS for receive/read/delete operations.
+
+config APP_TB45_SMS_RX_AUTO_DELETE
+    bool "Auto-delete SMS after successful receive processing"
+    default y
+    help
+      Execute AT+CMGD=<index> after successful parse/dispatch of one message.
+
+config APP_TB45_SMS_RX_STARTUP_CLEANUP
+    bool "Delete all existing SMS once at startup"
+    default y
+    help
+      Execute AT+CMGD=1,4 after receive setup to start from a clean state.
 
 endmenu
