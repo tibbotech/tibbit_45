@@ -1,6 +1,8 @@
 #ifndef TB45_SMS_AT_HELPER_H_
 #define TB45_SMS_AT_HELPER_H_
 
+#include <stddef.h>
+
 struct shell;
 
 /**
@@ -45,5 +47,25 @@ int tb45_sms_at_run(const struct shell *sh, const char *request, const char *exp
  */
 int tb45_sms_at_send_text_raw(const struct shell *sh, const char *cmgs_cmd, const char *text,
 			      int submit_timeout_ms);
+
+/**
+ * @brief Execute one AT command and capture response until final OK.
+ *
+ * Captured output contains the raw modem response bytes received before
+ * completion and is always null-terminated when @p out_buf is provided.
+ *
+ * @param request AT request string.
+ * @param out_buf Optional output buffer for response capture.
+ * @param out_buf_size Output buffer size in bytes.
+ * @param timeout_ms Command timeout in milliseconds.
+ *
+ * @retval 0 On success.
+ * @retval -EINVAL Invalid arguments.
+ * @retval -EPERM Modem user pipe is not ready.
+ * @retval -EBUSY Another user-pipe script is running.
+ * @retval -ETIMEDOUT Command timed out.
+ * @retval -EIO Modem returned ERROR.
+ */
+int tb45_sms_at_exec_capture(const char *request, char *out_buf, size_t out_buf_size, int timeout_ms);
 
 #endif /* TB45_SMS_AT_HELPER_H_ */
