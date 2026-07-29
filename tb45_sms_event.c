@@ -21,7 +21,7 @@ LOG_MODULE_REGISTER(tb45_sms_event, CONFIG_LOG_DEFAULT_LEVEL);
 
 K_MSGQ_DEFINE(tb45_sms_event_msgq, sizeof(struct tb45_sms_event), TB45_SMS_EVENT_QUEUE_DEPTH, 4);
 
-static struct k_work_poll tb45_sms_event_dispatch_poll_work;
+static struct k_work_poll tb45_sms_event_dispatch_poll_work = {0};
 static struct k_poll_event tb45_sms_event_dispatch_poll_events[] = {
 	K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE,
 					K_POLL_MODE_NOTIFY_ONLY,
@@ -31,7 +31,7 @@ static struct k_poll_event tb45_sms_event_dispatch_poll_events[] = {
 
 #if defined(CONFIG_APP_TB45_SMS_RESULT_WORKER_ENABLE) && CONFIG_APP_TB45_SMS_RESULT_WORKER_ENABLE
 extern struct k_sem tb45_sms_result_sem;
-static struct k_work_poll tb45_sms_result_poll_work;
+static struct k_work_poll tb45_sms_result_poll_work = {0};
 static struct k_poll_event tb45_sms_result_poll_events[] = {
 	K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
 					K_POLL_MODE_NOTIFY_ONLY,
@@ -41,8 +41,8 @@ static struct k_poll_event tb45_sms_result_poll_events[] = {
 #endif
 
 K_MUTEX_DEFINE(tb45_sms_event_cb_lock);
-static tb45_sms_event_cb_t tb45_sms_event_cb;
-static void *tb45_sms_event_cb_user_data;
+static tb45_sms_event_cb_t tb45_sms_event_cb = NULL;
+static void *tb45_sms_event_cb_user_data = NULL;
 static atomic_t tb45_sms_event_started = ATOMIC_INIT(0);
 static atomic_t tb45_sms_last_serial_rx_ms = ATOMIC_INIT(0);
 static atomic_t tb45_sms_event_wq_not_ready_warned = ATOMIC_INIT(0);
@@ -50,13 +50,13 @@ static atomic_t tb45_sms_event_wq_not_ready_warned = ATOMIC_INIT(0);
 static void tb45_sms_event_dispatch_send(const struct tb45_sms_event *event)
 {
 	switch (event->type) {
-	case TB45_SMS_EVENT_TYPE_ENQUEUE_MSG_STATUS:
+	case TB45_SMS_EVENT_TYPE_SEND_MSG_STATUS:
 		if (event->status == 0) {
-			LOG_DBG("[SMS_ENQUEUE] enqueue_ok id=%u phone=%s", event->send.message_id,
-				event->send.phone);
+			LOG_INF("[SMS_SND] send_ok id=%u phone=%s", event->data.send.message_id,
+				event->data.send.phone);
 		} else {
-			LOG_ERR("[SMS_ENQUEUE] enqueue_fail id=%u rc=%d phone=%s",
-				event->send.message_id, event->status, event->send.phone);
+			LOG_ERR("[SMS_SND] send_fail id=%u rc=%d phone=%s",
+				event->data.send.message_id, event->status, event->data.send.phone);
 		}
 		break;
 	default:
@@ -69,6 +69,14 @@ static void tb45_sms_event_dispatch_receive(const struct tb45_sms_event *event)
 	switch (event->type) {
 	case TB45_SMS_EVENT_TYPE_RECEIVE_SERIAL_STATUS:
 		LOG_DBG("[SMS_RCV]: serial-rx ts=%u", event->timestamp_ms);
+		break;
+	case TB45_SMS_EVENT_TYPE_RECEIVE_MSG_OUTPUT:
+		if (event->status == 0) {
+			LOG_INF("[SMS_RCV] ready idx=%u", event->data.receive.storage_index);
+		} else {
+			LOG_ERR("[SMS_RCV] failed idx=%u rc=%d", event->data.receive.storage_index,
+				event->status);
+		}
 		break;
 	default:
 		break;
@@ -98,7 +106,7 @@ static void tb45_sms_event_publish(const struct tb45_sms_event *event)
 {
 	int ret = k_msgq_put(&tb45_sms_event_msgq, event, K_NO_WAIT);
 	if (ret != 0) {
-		LOG_WRN("SMS_SND queue full; dropped type=%d", (int)event->type);
+		LOG_WRN("SMS_EVT queue full; dropped type=%d", (int)event->type);
 	}
 }
 
@@ -194,9 +202,9 @@ static void tb45_sms_result_worker(struct k_work *work)
 			.status = result.result,
 			.timestamp_ms = (uint32_t)k_uptime_get_32(),
 		};
-		event.send.message_id = result.request_id;
-		(void)snprintf(event.send.phone, sizeof(event.send.phone), "%s", result.phone);
-		tb45_sms_event_publish(&event);
+		event.data.send.message_id = result.request_id;
+		(void)snprintf(event.data.send.phone, sizeof(event.data.send.phone), "%s", result.phone);
+		tb45_sms_event_dispatch_combined(&event);
 	}
 
 	int ret = tb45_sms_event_submit_result_poll();
@@ -271,24 +279,7 @@ void tb45_sms_event_on_cmti(uint16_t storage_index)
 	(void)tb45_sms_receive_trigger_index(storage_index);
 }
 
-void tb45_sms_event_notify_enqueue(const struct tb45_sms_request *request, int status)
-{
-	struct tb45_sms_event event = {
-		.type = TB45_SMS_EVENT_TYPE_ENQUEUE_MSG_STATUS,
-		.status = status,
-		.timestamp_ms = (uint32_t)k_uptime_get_32(),
-	};
-
-	if (request != NULL) {
-		event.send.message_id = request->message_id;
-		(void)snprintf(event.send.phone, sizeof(event.send.phone), "%s",
-			       request->phone_number);
-	}
-
-	tb45_sms_event_publish(&event);
-}
-
-void tb45_sms_event_notify_rx_message(const struct tb45_sms_rx_message *message, int status)
+void tb45_sms_event_notify_rx_message(uint16_t storage_index, int status)
 {
 	struct tb45_sms_event event = {
 		.type = TB45_SMS_EVENT_TYPE_RECEIVE_MSG_OUTPUT,
@@ -296,14 +287,6 @@ void tb45_sms_event_notify_rx_message(const struct tb45_sms_rx_message *message,
 		.timestamp_ms = (uint32_t)k_uptime_get_32(),
 	};
 
-	if (message != NULL) {
-		event.receive.storage_index = message->storage_index;
-		(void)snprintf(event.receive.phone, sizeof(event.receive.phone), "%s", message->phone);
-		(void)snprintf(event.receive.date_time, sizeof(event.receive.date_time), "%s",
-			       message->timestamp);
-		(void)snprintf(event.receive.message, sizeof(event.receive.message), "%s",
-			       message->message);
-	}
-
+	event.data.receive.storage_index = storage_index;
 	tb45_sms_event_publish(&event);
 }

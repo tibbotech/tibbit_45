@@ -1,5 +1,7 @@
 #include "tb45_sms.h"
 #include "tb45_async_job.h"
+#include "tb45_async_job_internal.h"
+#include "tb45_delayable_retry.h"
 #include "tb45_sms_event.h"
 #include "tb45_sms_at_helper.h"
 
@@ -34,12 +36,18 @@ LOG_MODULE_REGISTER(tb45_sms, CONFIG_LOG_DEFAULT_LEVEL);
 #define TB45_SMS_RESULT_QUEUE_DEPTH       CONFIG_APP_TB45_SMS_RESULT_QUEUE_DEPTH
 #define TB45_SMS_RX_TRIGGER_QUEUE_DEPTH   CONFIG_APP_TB45_SMS_RX_TRIGGER_QUEUE_DEPTH
 #define TB45_SMS_RX_RESULT_QUEUE_DEPTH    CONFIG_APP_TB45_SMS_RX_RESULT_QUEUE_DEPTH
-#define TB45_SMS_RX_AUTO_DELETE           CONFIG_APP_TB45_SMS_RX_AUTO_DELETE
-#define TB45_SMS_RX_STARTUP_CLEANUP       CONFIG_APP_TB45_SMS_RX_STARTUP_CLEANUP
+#define TB45_SMS_RX_SCAN_MAX_INDEXES      CONFIG_APP_TB45_SMS_RX_SCAN_MAX_INDEXES
+#define TB45_SMS_RX_AUTO_DELETE           IS_ENABLED(CONFIG_APP_TB45_SMS_RX_AUTO_DELETE)
+#define TB45_SMS_RX_STARTUP_CLEANUP       IS_ENABLED(CONFIG_APP_TB45_SMS_RX_STARTUP_CLEANUP)
 #define TB45_SMS_RX_STORAGE               CONFIG_APP_TB45_SMS_RX_STORAGE
 
-#define TB45_SMS_RX_CAPTURE_BUF_SIZE      768
-#define TB45_SMS_RX_INIT_RETRY_DELAY_MS   2000
+#define TB45_SMS_RX_CAPTURE_BUF_SIZE          768
+#define TB45_SMS_RX_INIT_RETRY_DELAY_MS       2000U
+#define TB45_SMS_RX_INIT_PIPE_WAIT_DELAY_MS   2000U
+#define TB45_SMS_RX_INIT_BUSY_DELAY_MS        250U
+#define TB45_SMS_RX_DELETE_RETRY_DELAY_MS     100U
+#define TB45_SMS_RX_DELETE_MAX_ATTEMPTS       3U
+#define TB45_SMS_RX_BUSY_LOG_INTERVAL         20U
 #define TB45_SMS_SHELL_ASCII_CTRL_C       0x03U
 #define TB45_SMS_SLEEP_SLICE_MS           50
 
@@ -48,19 +56,54 @@ struct tb45_sms_rx_trigger {
 	uint8_t full_scan;
 };
 
-struct tb45_sms_wait_ctx {
-	struct k_sem done;
-	int result;
+enum tb45_sms_rx_init_state {
+	TB45_SMS_RX_INIT_STATE_IDLE = 0,
+	TB45_SMS_RX_INIT_STATE_CMGF,
+	TB45_SMS_RX_INIT_STATE_CSCS,
+	TB45_SMS_RX_INIT_STATE_CPMS,
+	TB45_SMS_RX_INIT_STATE_CNMI,
+	TB45_SMS_RX_INIT_STATE_CLEANUP,
+	TB45_SMS_RX_INIT_STATE_READY,
+};
+
+struct tb45_sms_rx_init_ctx {
+	struct tb45_delayable_retry retry;
+	struct k_work continue_work;
+	enum tb45_sms_rx_init_state state;
+	struct tb45_sms_rx_trigger pending_trigger;
+	char cpms_cmd[48];
+	int last_ret;
+	bool pending_trigger_valid;
+};
+
+struct tb45_sms_rx_delete_ctx {
+	struct tb45_delayable_retry retry;
+	uint16_t storage_index;
+	char cmd[24];
+	int last_ret;
+};
+
+enum tb45_sms_rx_capture_state {
+	TB45_SMS_RX_CAPTURE_STATE_IDLE = 0,
+	TB45_SMS_RX_CAPTURE_STATE_CMGL,
+};
+
+struct tb45_sms_rx_capture_ctx {
+	struct k_work continue_work;
+	enum tb45_sms_rx_capture_state state;
+	int last_ret;
+	bool active;
 };
 
 K_SEM_DEFINE(tb45_sms_result_sem, 0, TB45_SMS_RESULT_QUEUE_DEPTH);
 K_MUTEX_DEFINE(tb45_sms_result_lock);
-static struct tb45_sms_result tb45_sms_results[TB45_SMS_RESULT_QUEUE_DEPTH];
-static uint16_t tb45_sms_result_head;
-static uint16_t tb45_sms_result_tail;
-static uint16_t tb45_sms_result_count;
+static struct tb45_sms_result tb45_sms_results[TB45_SMS_RESULT_QUEUE_DEPTH] = {0};
+static uint16_t tb45_sms_result_head = 0U;
+static uint16_t tb45_sms_result_tail = 0U;
+static uint16_t tb45_sms_result_count = 0U;
 static atomic_t tb45_sms_request_id_seed = ATOMIC_INIT(1);
 static atomic_t tb45_sms_rx_started = ATOMIC_INIT(0);
+static atomic_t tb45_sms_rx_start_allowed = ATOMIC_INIT(0);
 static atomic_t tb45_sms_rx_setup_done = ATOMIC_INIT(0);
 static atomic_t tb45_sms_rx_cleanup_done = ATOMIC_INIT(0);
 static atomic_t tb45_sms_rx_init_wait_logged = ATOMIC_INIT(0);
@@ -74,24 +117,46 @@ static atomic_t tb45_sms_rx_delete_fail_count = ATOMIC_INIT(0);
 static atomic_t tb45_sms_rx_trigger_queue_drop_count = ATOMIC_INIT(0);
 static atomic_t tb45_sms_rx_result_queue_drop_count = ATOMIC_INIT(0);
 static atomic_t tb45_sms_async_result_queue_drop_count = ATOMIC_INIT(0);
-static char tb45_sms_rx_capture_buf[TB45_SMS_RX_CAPTURE_BUF_SIZE];
+static char tb45_sms_rx_capture_buf[TB45_SMS_RX_CAPTURE_BUF_SIZE] = {0};
 
 K_MSGQ_DEFINE(tb45_sms_rx_trigger_msgq, sizeof(struct tb45_sms_rx_trigger),
 	      TB45_SMS_RX_TRIGGER_QUEUE_DEPTH, 4);
-K_MSGQ_DEFINE(tb45_sms_rx_result_msgq, sizeof(struct tb45_sms_rx_message),
+K_MSGQ_DEFINE(tb45_sms_rx_result_msgq, sizeof(struct tb45_sms_rx_notice),
 	      TB45_SMS_RX_RESULT_QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(tb45_sms_rx_delete_msgq, sizeof(uint16_t), TB45_SMS_RX_TRIGGER_QUEUE_DEPTH, 2);
 
 static int tb45_sms_rx_enqueue_trigger(uint16_t storage_index, uint8_t full_scan);
+static void tb45_sms_rx_reset_runtime_state(void);
 
-static struct k_work_poll tb45_sms_rx_poll_work;
+static struct k_work_poll tb45_sms_rx_poll_work = {0};
 static struct k_poll_event tb45_sms_rx_poll_events[] = {
 	K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE,
 					K_POLL_MODE_NOTIFY_ONLY,
 					&tb45_sms_rx_trigger_msgq,
 					0),
+	K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE,
+					K_POLL_MODE_NOTIFY_ONLY,
+					&tb45_sms_rx_delete_msgq,
+					0),
 };
-static struct k_work_delayable tb45_sms_rx_retry_work;
+static struct tb45_sms_rx_init_ctx tb45_sms_rx_init_ctx = {0};
+static struct tb45_sms_rx_delete_ctx tb45_sms_rx_delete_ctx = {0};
+static struct tb45_sms_rx_capture_ctx tb45_sms_rx_capture_ctx = {0};
 static atomic_t tb45_sms_rx_wq_not_ready_warned = ATOMIC_INIT(0);
+
+static void tb45_sms_rx_reset_runtime_state(void)
+{
+	atomic_set(&tb45_sms_rx_setup_done, 0);
+	atomic_set(&tb45_sms_rx_cleanup_done, 0);
+	atomic_set(&tb45_sms_rx_init_wait_logged, 0);
+	atomic_set(&tb45_sms_rx_init_completed_logged, 0);
+	tb45_sms_rx_init_ctx.state = TB45_SMS_RX_INIT_STATE_IDLE;
+	tb45_sms_rx_init_ctx.last_ret = 0;
+	tb45_sms_rx_init_ctx.pending_trigger_valid = false;
+	tb45_sms_rx_capture_ctx.state = TB45_SMS_RX_CAPTURE_STATE_IDLE;
+	tb45_sms_rx_capture_ctx.last_ret = 0;
+	tb45_sms_rx_capture_ctx.active = false;
+}
 
 static bool tb45_sms_rx_wq_ready(void)
 {
@@ -114,6 +179,7 @@ static int tb45_sms_rx_submit_poll(void)
 	}
 
 	tb45_sms_rx_poll_events[0].state = K_POLL_STATE_NOT_READY;
+	tb45_sms_rx_poll_events[1].state = K_POLL_STATE_NOT_READY;
 	return k_work_poll_submit_to_queue(&low_priority_wq,
 					   &tb45_sms_rx_poll_work,
 					   tb45_sms_rx_poll_events,
@@ -121,24 +187,395 @@ static int tb45_sms_rx_submit_poll(void)
 					   K_FOREVER);
 }
 
-static void tb45_sms_rx_retry_work_handler(struct k_work *work)
+static void tb45_sms_rx_resume_poll(void)
 {
-	ARG_UNUSED(work);
-	(void)tb45_sms_rx_enqueue_trigger(0U, 1U);
+	int ret = tb45_sms_rx_submit_poll();
+	if ((ret != 0) && (ret != -EAGAIN) && (ret != -EADDRINUSE)) {
+		LOG_ERR("SMS_RCV poll submit failed (%d)", ret);
+	}
 }
 
-static void tb45_sms_rx_schedule_retry(void)
+static bool tb45_sms_rx_init_is_ready(void)
 {
-	if (!tb45_sms_rx_wq_ready()) {
-		(void)tb45_sms_rx_enqueue_trigger(0U, 1U);
+	if (atomic_get(&tb45_sms_rx_setup_done) == 0) {
+		return false;
+	}
+
+	if (TB45_SMS_RX_STARTUP_CLEANUP == 0) {
+		return true;
+	}
+
+	return atomic_get(&tb45_sms_rx_cleanup_done) != 0;
+}
+
+static void tb45_sms_rx_init_merge_trigger(const struct tb45_sms_rx_trigger *trigger)
+{
+	struct tb45_sms_rx_trigger *pending = &tb45_sms_rx_init_ctx.pending_trigger;
+
+	if (trigger == NULL) {
 		return;
 	}
 
-	int ret = k_work_reschedule_for_queue(&low_priority_wq, &tb45_sms_rx_retry_work,
-					      K_MSEC(TB45_SMS_RX_INIT_RETRY_DELAY_MS));
-	if (ret < 0) {
-		LOG_WRN("SMS_RCV retry schedule failed (%d)", ret);
+	if (!tb45_sms_rx_init_ctx.pending_trigger_valid) {
+		tb45_sms_rx_init_ctx.pending_trigger = *trigger;
+		tb45_sms_rx_init_ctx.pending_trigger_valid = true;
+		return;
 	}
+
+	if ((pending->full_scan != 0U) || (trigger->full_scan != 0U) ||
+	    (pending->storage_index != trigger->storage_index)) {
+		pending->storage_index = 0U;
+		pending->full_scan = 1U;
+	}
+}
+
+static void tb45_sms_rx_init_kick_pending_trigger(void)
+{
+	struct tb45_sms_rx_trigger trigger;
+
+	if (!tb45_sms_rx_init_ctx.pending_trigger_valid) {
+		return;
+	}
+
+	trigger = tb45_sms_rx_init_ctx.pending_trigger;
+	tb45_sms_rx_init_ctx.pending_trigger_valid = false;
+	(void)tb45_sms_rx_enqueue_trigger(trigger.storage_index, trigger.full_scan);
+}
+
+static int tb45_sms_rx_init_start_step(struct tb45_sms_rx_init_ctx *ctx);
+static void tb45_sms_rx_init_continue_work_handler(struct k_work *work);
+
+static void tb45_sms_rx_init_at_complete(int ret, void *user_data)
+{
+	struct tb45_sms_rx_init_ctx *ctx = user_data;
+	int submit_ret;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	if (ret < 0) {
+		ctx->last_ret = ret;
+		(void)tb45_delayable_retry_complete(&ctx->retry, ret);
+		return;
+	}
+
+	switch (ctx->state) {
+	case TB45_SMS_RX_INIT_STATE_CMGF:
+		ctx->state = TB45_SMS_RX_INIT_STATE_CSCS;
+		break;
+	case TB45_SMS_RX_INIT_STATE_CSCS:
+		ctx->state = TB45_SMS_RX_INIT_STATE_CPMS;
+		break;
+	case TB45_SMS_RX_INIT_STATE_CPMS:
+		ctx->state = TB45_SMS_RX_INIT_STATE_CNMI;
+		break;
+	case TB45_SMS_RX_INIT_STATE_CNMI:
+		atomic_set(&tb45_sms_rx_setup_done, 1);
+		ctx->state = (TB45_SMS_RX_STARTUP_CLEANUP != 0) ?
+			TB45_SMS_RX_INIT_STATE_CLEANUP : TB45_SMS_RX_INIT_STATE_READY;
+		break;
+	case TB45_SMS_RX_INIT_STATE_CLEANUP:
+		atomic_set(&tb45_sms_rx_cleanup_done, 1);
+		ctx->state = TB45_SMS_RX_INIT_STATE_READY;
+		break;
+	case TB45_SMS_RX_INIT_STATE_IDLE:
+	case TB45_SMS_RX_INIT_STATE_READY:
+	default:
+		break;
+	}
+
+	if (ctx->state == TB45_SMS_RX_INIT_STATE_READY) {
+		(void)tb45_delayable_retry_complete(&ctx->retry, 0);
+		return;
+	}
+
+	submit_ret = k_work_submit_to_queue(&low_priority_wq, &ctx->continue_work);
+	if (submit_ret < 0) {
+		ctx->last_ret = submit_ret;
+		(void)tb45_delayable_retry_complete(&ctx->retry, submit_ret);
+	}
+}
+static void tb45_sms_rx_init_continue_work_handler(struct k_work *work)
+{
+	struct tb45_sms_rx_init_ctx *ctx = CONTAINER_OF(work, struct tb45_sms_rx_init_ctx,
+							continue_work);
+	int start_ret;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	start_ret = tb45_sms_rx_init_start_step(ctx);
+	if (start_ret != -EINPROGRESS) {
+		ctx->last_ret = start_ret;
+		(void)tb45_delayable_retry_complete(&ctx->retry, start_ret);
+	}
+}
+
+
+static int tb45_sms_rx_init_start_step(struct tb45_sms_rx_init_ctx *ctx)
+{
+	const char *cmd = NULL;
+	int ret;
+
+	if (ctx == NULL) {
+		return -EINVAL;
+	}
+
+	switch (ctx->state) {
+	case TB45_SMS_RX_INIT_STATE_CMGF:
+		cmd = "AT+CMGF=1";
+		break;
+	case TB45_SMS_RX_INIT_STATE_CSCS:
+		cmd = "AT+CSCS=\"IRA\"";
+		break;
+	case TB45_SMS_RX_INIT_STATE_CPMS:
+		ret = snprintf(ctx->cpms_cmd, sizeof(ctx->cpms_cmd),
+			      "AT+CPMS=\"%s\",\"%s\",\"%s\"", TB45_SMS_RX_STORAGE,
+			      TB45_SMS_RX_STORAGE, TB45_SMS_RX_STORAGE);
+		if ((ret < 0) || ((size_t)ret >= sizeof(ctx->cpms_cmd))) {
+			return -EINVAL;
+		}
+		cmd = ctx->cpms_cmd;
+		break;
+	case TB45_SMS_RX_INIT_STATE_CNMI:
+		cmd = "AT+CNMI=2,1,0,0,0";
+		break;
+	case TB45_SMS_RX_INIT_STATE_CLEANUP:
+		cmd = "AT+CMGD=1,4";
+		break;
+	case TB45_SMS_RX_INIT_STATE_READY:
+		return 0;
+	case TB45_SMS_RX_INIT_STATE_IDLE:
+	default:
+		return -EINVAL;
+	}
+
+	ret = tb45_sms_at_run_async_cb(NULL, cmd, "OK", TB45_SMS_INIT_AT_TIMEOUT_MS,
+					tb45_sms_rx_init_at_complete, ctx);
+	if (ret < 0) {
+		ctx->last_ret = ret;
+		return ret;
+	}
+
+	return -EINPROGRESS;
+}
+
+static int tb45_sms_rx_init_run_attempt(struct tb45_delayable_retry *retry, uint8_t attempt)
+{
+	struct tb45_sms_rx_init_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_init_ctx, retry);
+
+	ARG_UNUSED(attempt);
+
+	if (ctx == NULL) {
+		return -EINVAL;
+	}
+
+	if (tb45_sms_rx_init_is_ready()) {
+		ctx->state = TB45_SMS_RX_INIT_STATE_READY;
+		return 0;
+	}
+
+	ctx->state = (atomic_get(&tb45_sms_rx_setup_done) == 0) ?
+		TB45_SMS_RX_INIT_STATE_CMGF : TB45_SMS_RX_INIT_STATE_CLEANUP;
+	return tb45_sms_rx_init_start_step(ctx);
+}
+
+static uint32_t tb45_sms_rx_init_retry_delay_ms(struct tb45_delayable_retry *retry, uint8_t attempt)
+{
+	struct tb45_sms_rx_init_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_init_ctx, retry);
+
+	ARG_UNUSED(attempt);
+	if (ctx == NULL) {
+		return TB45_SMS_RX_INIT_RETRY_DELAY_MS;
+	}
+
+	if (ctx->last_ret == -EPERM) {
+		return TB45_SMS_RX_INIT_PIPE_WAIT_DELAY_MS;
+	}
+
+	if (ctx->last_ret == -EBUSY) {
+		return TB45_SMS_RX_INIT_BUSY_DELAY_MS;
+	}
+
+	return TB45_SMS_RX_INIT_RETRY_DELAY_MS;
+}
+
+static void tb45_sms_rx_init_attempt_failed(struct tb45_delayable_retry *retry, int ret, uint8_t attempt,
+				    uint8_t max_attempts)
+{
+	struct tb45_sms_rx_init_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_init_ctx, retry);
+	uint32_t retry_count;
+	uint32_t retry_display;
+	bool rate_limited;
+
+	if (ctx != NULL) {
+		ctx->last_ret = ret;
+	}
+
+	atomic_inc(&tb45_sms_rx_init_retry_count);
+	retry_count = (uint32_t)atomic_get(&tb45_sms_rx_init_retry_count);
+	retry_display = (max_attempts == 0U) ? retry_count : (uint32_t)attempt;
+	rate_limited = ((ret == -EBUSY) || (ret == -EPERM)) &&
+		((retry_count % TB45_SMS_RX_BUSY_LOG_INTERVAL) != 0U);
+	if (rate_limited) {
+		return;
+	}
+
+	if ((ctx != NULL) && (ctx->state == TB45_SMS_RX_INIT_STATE_CLEANUP)) {
+		LOG_WRN("SMS_RCV startup cleanup pending (%d), retry %u%s", ret, retry_display,
+			(max_attempts == 0U) ? "/inf" : "");
+	} else {
+		LOG_WRN("SMS_RCV setup pending (%d), retry %u%s", ret, retry_display,
+			(max_attempts == 0U) ? "/inf" : "");
+	}
+}
+
+static void tb45_sms_rx_init_complete(struct tb45_delayable_retry *retry, int ret)
+{
+	ARG_UNUSED(retry);
+
+	if (ret == 0) {
+		if (atomic_cas(&tb45_sms_rx_init_completed_logged, 0, 1)) {
+			LOG_INF("SMS_RCV initialization...completed");
+		}
+		tb45_sms_rx_init_kick_pending_trigger();
+		return;
+	}
+
+	LOG_ERR("SMS_RCV initialization failed (%d)", ret);
+}
+
+static const struct tb45_delayable_retry_ops tb45_sms_rx_init_retry_ops = {
+	.run_attempt = tb45_sms_rx_init_run_attempt,
+	.retry_delay_ms = tb45_sms_rx_init_retry_delay_ms,
+	.attempt_failed = tb45_sms_rx_init_attempt_failed,
+	.complete = tb45_sms_rx_init_complete,
+};
+
+static void tb45_sms_rx_delete_at_complete(int ret, void *user_data)
+{
+	struct tb45_sms_rx_delete_ctx *ctx = user_data;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	ctx->last_ret = ret;
+	(void)tb45_delayable_retry_complete(&ctx->retry, ret);
+}
+
+static int tb45_sms_rx_delete_run_attempt(struct tb45_delayable_retry *retry, uint8_t attempt)
+{
+	struct tb45_sms_rx_delete_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_delete_ctx, retry);
+	int ret;
+
+	ARG_UNUSED(attempt);
+
+	if ((ctx == NULL) || (ctx->storage_index == 0U)) {
+		return -EINVAL;
+	}
+
+	ret = snprintf(ctx->cmd, sizeof(ctx->cmd), "AT+CMGD=%u", ctx->storage_index);
+	if ((ret < 0) || ((size_t)ret >= sizeof(ctx->cmd))) {
+		return -EINVAL;
+	}
+
+	ret = tb45_sms_at_run_async_cb(NULL, ctx->cmd, "OK", TB45_SMS_INIT_AT_TIMEOUT_MS,
+					tb45_sms_rx_delete_at_complete, ctx);
+	if (ret < 0) {
+		ctx->last_ret = ret;
+		return ret;
+	}
+
+	return -EINPROGRESS;
+}
+
+static uint32_t tb45_sms_rx_delete_retry_delay_ms(struct tb45_delayable_retry *retry, uint8_t attempt)
+{
+	ARG_UNUSED(retry);
+	ARG_UNUSED(attempt);
+	return TB45_SMS_RX_DELETE_RETRY_DELAY_MS;
+}
+
+static void tb45_sms_rx_delete_attempt_failed(struct tb45_delayable_retry *retry, int ret, uint8_t attempt,
+				      uint8_t max_attempts)
+{
+	struct tb45_sms_rx_delete_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_delete_ctx, retry);
+
+	if ((ctx == NULL) || (ctx->storage_index == 0U)) {
+		return;
+	}
+
+	ctx->last_ret = ret;
+	if ((max_attempts != 0U) && (attempt < max_attempts)) {
+		return;
+	}
+
+	atomic_inc(&tb45_sms_rx_delete_fail_count);
+	LOG_WRN("SMS_RCV delete failed idx=%u (%d)", ctx->storage_index, ret);
+}
+
+static void tb45_sms_rx_delete_complete(struct tb45_delayable_retry *retry, int ret)
+{
+	struct tb45_sms_rx_delete_ctx *ctx =
+		CONTAINER_OF(retry, struct tb45_sms_rx_delete_ctx, retry);
+
+	ARG_UNUSED(ret);
+	if (ctx == NULL) {
+		return;
+	}
+
+	ctx->storage_index = 0U;
+	tb45_sms_rx_resume_poll();
+}
+
+static const struct tb45_delayable_retry_ops tb45_sms_rx_delete_retry_ops = {
+	.run_attempt = tb45_sms_rx_delete_run_attempt,
+	.retry_delay_ms = tb45_sms_rx_delete_retry_delay_ms,
+	.attempt_failed = tb45_sms_rx_delete_attempt_failed,
+	.complete = tb45_sms_rx_delete_complete,
+};
+
+static void tb45_sms_rx_delete_kick(void)
+{
+	uint16_t storage_index;
+	int ret;
+
+	if (tb45_delayable_retry_is_pending(&tb45_sms_rx_delete_ctx.retry)) {
+		return;
+	}
+
+	ret = k_msgq_get(&tb45_sms_rx_delete_msgq, &storage_index, K_NO_WAIT);
+	if (ret == -ENOMSG) {
+		return;
+	}
+
+	if (ret < 0) {
+		LOG_ERR("SMS_RCV delete queue read failed (%d)", ret);
+		return;
+	}
+
+	tb45_sms_rx_delete_ctx.storage_index = storage_index;
+	(void)tb45_delayable_retry_start(&tb45_sms_rx_delete_ctx.retry,
+					 TB45_SMS_RX_DELETE_MAX_ATTEMPTS);
+}
+
+static int tb45_sms_rx_enqueue_delete(uint16_t storage_index)
+{
+	int ret = k_msgq_put(&tb45_sms_rx_delete_msgq, &storage_index, K_NO_WAIT);
+
+	if (ret == 0) {
+		(void)tb45_sms_rx_submit_poll();
+	}
+
+	return ret;
 }
 
 static void tb45_sms_print_usage(const struct shell *sh)
@@ -151,8 +588,8 @@ static void tb45_sms_print_usage(const struct shell *sh)
 	}
 #endif
 
-	LOG_WRN("Usage: tb45 sms send <phone> <text>");
-	LOG_WRN("Example: tb45 sms send \"+886123456789\" \"hello\"");
+	LOG_WRN("Usage: tb45 sms send <phone> <text>\r\n"
+		"Example: tb45 sms send \"+886123456789\" \"hello\"");
 }
 
 #if defined(CONFIG_SHELL)
@@ -316,6 +753,11 @@ static int tb45_sms_rx_enqueue_trigger(uint16_t storage_index, uint8_t full_scan
 		.full_scan = full_scan,
 	};
 	struct tb45_sms_rx_trigger dropped;
+
+	if (atomic_get(&tb45_sms_rx_start_allowed) == 0) {
+		return -EAGAIN;
+	}
+
 	int ret = k_msgq_put(&tb45_sms_rx_trigger_msgq, &trigger, K_NO_WAIT);
 
 	if (ret == 0) {
@@ -338,12 +780,17 @@ static int tb45_sms_rx_enqueue_trigger(uint16_t storage_index, uint8_t full_scan
 	return ret;
 }
 
-static void tb45_sms_rx_publish_message(const struct tb45_sms_rx_message *message)
+static void tb45_sms_rx_publish_notice(uint16_t storage_index, int status)
 {
-	struct tb45_sms_rx_message dropped;
-	int ret = k_msgq_put(&tb45_sms_rx_result_msgq, message, K_NO_WAIT);
+	struct tb45_sms_rx_notice notice = {
+		.storage_index = storage_index,
+		.status = status,
+	};
+	struct tb45_sms_rx_notice dropped;
+	int ret = k_msgq_put(&tb45_sms_rx_result_msgq, &notice, K_NO_WAIT);
 
 	if (ret == 0) {
+		tb45_sms_event_notify_rx_message(storage_index, status);
 		return;
 	}
 
@@ -354,10 +801,13 @@ static void tb45_sms_rx_publish_message(const struct tb45_sms_rx_message *messag
 
 	atomic_inc(&tb45_sms_rx_result_queue_drop_count);
 	(void)k_msgq_get(&tb45_sms_rx_result_msgq, &dropped, K_NO_WAIT);
-	ret = k_msgq_put(&tb45_sms_rx_result_msgq, message, K_NO_WAIT);
+	ret = k_msgq_put(&tb45_sms_rx_result_msgq, &notice, K_NO_WAIT);
 	if (ret < 0) {
-		LOG_WRN("SMS_RCV queue overflow; dropped message idx=%u", message->storage_index);
+		LOG_WRN("SMS_RCV queue overflow; dropped notice idx=%u", storage_index);
+		return;
 	}
+
+	tb45_sms_event_notify_rx_message(storage_index, status);
 }
 
 static bool tb45_sms_parse_u16(const char *str, uint16_t *out_value)
@@ -594,10 +1044,19 @@ static size_t tb45_sms_parse_cmgl_unread_indexes(const char *response, uint16_t 
 	return count;
 }
 
+
+/*
+ * job: destination async job to populate
+ * type: async SMS mode to enqueue
+ * request: SMS payload and metadata to send
+ * completion_ctx: optional wait context for TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT
+ */
 static int tb45_sms_build_enqueue_job(struct tb45_async_job *job,
-				      const struct tb45_sms_request *request, uint8_t capture_result,
+				      enum tb45_async_job_type type,
+				      const struct tb45_sms_request *request,
 				      void *completion_ctx)
 {
+	struct tb45_sms_request *job_request;
 	size_t phone_len;
 	size_t text_len;
 
@@ -618,49 +1077,132 @@ static int tb45_sms_build_enqueue_job(struct tb45_async_job *job,
 	}
 
 	phone_len = strlen(request->phone_number);
-	job->type = TB45_ASYNC_JOB_TYPE_SMS_SEND;
-	memcpy(job->payload.sms_send.request.phone_number, request->phone_number, phone_len + 1);
-	memcpy(job->payload.sms_send.request.message, request->message, text_len + 1);
-	job->payload.sms_send.request.message_id = request->message_id;
-	job->payload.sms_send.capture_result = capture_result;
-	job->payload.sms_send.completion_ctx = completion_ctx;
+	job->type = type;
+
+	switch (type) {
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND:
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT:
+		job_request = &job->payload.sms_send.request;
+		break;
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT:
+		job->payload.sms_send_wait.completion_ctx = completion_ctx;
+		job_request = &job->payload.sms_send_wait.request;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	memcpy(job_request->phone_number, request->phone_number, phone_len + 1);
+	memcpy(job_request->message, request->message, text_len + 1);
+	job_request->message_id = request->message_id;
 
 	return 0;
 }
 
+static const struct tb45_sms_request *tb45_sms_async_job_request(const struct tb45_async_job *job)
+{
+	if (job == NULL) {
+		return NULL;
+	}
+
+	switch (job->type) {
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND:
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT:
+		return &job->payload.sms_send.request;
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT:
+		return &job->payload.sms_send_wait.request;
+	default:
+		return NULL;
+	}
+}
+
+static void *tb45_sms_async_job_completion_ctx(const struct tb45_async_job *job)
+{
+	if ((job == NULL) || (job->type != TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT)) {
+		return NULL;
+	}
+
+	return job->payload.sms_send_wait.completion_ctx;
+}
+
+static void tb45_sms_async_dispatch_at_complete(int ret, void *user_data)
+{
+	ARG_UNUSED(user_data);
+	tb45_async_dispatcher_complete_attempt(ret);
+}
+
 static int tb45_sms_async_dispatch(const struct tb45_async_job *job)
 {
-	if ((job == NULL) || (job->type != TB45_ASYNC_JOB_TYPE_SMS_SEND)) {
+	char cmgs_cmd[48];
+	const struct tb45_sms_request *request;
+	int ret;
+
+	request = tb45_sms_async_job_request(job);
+	if (request == NULL) {
 		return -EINVAL;
 	}
 
-	LOG_DBG("SMS async dispatch: sending to %s", job->payload.sms_send.request.phone_number);
-	int ret = tb45_sms_send(NULL, &job->payload.sms_send.request);
-	struct tb45_sms_wait_ctx *wait_ctx = job->payload.sms_send.completion_ctx;
-
-	if (job->payload.sms_send.capture_result != 0U) {
-		tb45_sms_store_async_result(job->payload.sms_send.request.message_id,
-					    job->payload.sms_send.request.phone_number, ret);
+	ret = snprintf(cmgs_cmd, sizeof(cmgs_cmd), "AT+CMGS=\"%s\"", request->phone_number);
+	if ((ret < 0) || ((size_t)ret >= sizeof(cmgs_cmd))) {
+		return -EINVAL;
 	}
 
-	if (wait_ctx != NULL) {
-		wait_ctx->result = ret;
-		k_sem_give(&wait_ctx->done);
+	LOG_DBG("SMS async dispatch: sending to %s", request->phone_number);
+	ret = tb45_sms_at_send_text_raw_async_cb(cmgs_cmd,
+		request->message,
+		TB45_SMS_SEND_ATTEMPT_TIMEOUT_MS,
+		tb45_sms_async_dispatch_at_complete, NULL);
+	if (ret < 0) {
+		return ret;
 	}
+
+	return -EINPROGRESS;
+}
+
+static void tb45_sms_async_complete(const struct tb45_async_job *job, int ret)
+{
+	const struct tb45_sms_request *request = tb45_sms_async_job_request(job);
+
+	if (request == NULL) {
+		return;
+	}
+
+	if (job->type == TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT) {
+		tb45_sms_store_async_result(request->message_id, request->phone_number, ret);
+	}
+
+	tb45_async_job_complete_wait_ctx(tb45_sms_async_job_completion_ctx(job), ret);
 
 	if (ret == 0) {
 		LOG_DBG("SMS async dispatch: sent successfully");
 	} else {
 		LOG_ERR("SMS async dispatch: send failed (%d)", ret);
 	}
-
-	return ret;
 }
 
 static int tb45_sms_async_register_handler(void)
 {
-	int ret = tb45_async_job_register_handler(TB45_ASYNC_JOB_TYPE_SMS_SEND,
-						  tb45_sms_async_dispatch);
+	int ret;
+
+	ret = tb45_async_job_register_handler(TB45_ASYNC_JOB_TYPE_SMS_SEND,
+					      tb45_sms_async_dispatch,
+					      tb45_sms_async_complete);
+	if (ret < 0) {
+		LOG_ERR("SMS async register failed (%d)", ret);
+		return 0;
+	}
+
+	ret = tb45_async_job_register_handler(TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT,
+					      tb45_sms_async_dispatch,
+					      tb45_sms_async_complete);
+	if (ret < 0) {
+		LOG_ERR("SMS async register failed (%d)", ret);
+		return 0;
+	}
+
+	ret = tb45_async_job_register_handler(TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT,
+					      tb45_sms_async_dispatch,
+					      tb45_sms_async_complete);
 	if (ret < 0) {
 		LOG_ERR("SMS async register failed (%d)", ret);
 	}
@@ -670,153 +1212,117 @@ static int tb45_sms_async_register_handler(void)
 
 SYS_INIT(tb45_sms_async_register_handler, POST_KERNEL, 99);
 
-static int tb45_sms_rx_configure_once(void)
+static void tb45_sms_rx_capture_finish(void)
 {
-	char cmd[48];
-	int ret;
+	struct tb45_sms_rx_capture_ctx *ctx = &tb45_sms_rx_capture_ctx;
 
-	if (atomic_get(&tb45_sms_rx_setup_done) != 0) {
-		return 0;
-	}
-
-	ret = tb45_sms_at_run(NULL, "AT+CMGF=1", "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = tb45_sms_at_run(NULL, "AT+CSCS=\"IRA\"", "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = snprintf(cmd, sizeof(cmd), "AT+CPMS=\"%s\",\"%s\",\"%s\"",
-		       TB45_SMS_RX_STORAGE, TB45_SMS_RX_STORAGE, TB45_SMS_RX_STORAGE);
-	if ((ret < 0) || ((size_t)ret >= sizeof(cmd))) {
-		return -EINVAL;
-	}
-
-	ret = tb45_sms_at_run(NULL, cmd, "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = tb45_sms_at_run(NULL, "AT+CNMI=2,1,0,0,0", "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		return ret;
-	}
-
-	atomic_set(&tb45_sms_rx_setup_done, 1);
-	LOG_DBG("SMS_RCV setup complete: CPMS=%s CNMI enabled", TB45_SMS_RX_STORAGE);
-	return 0;
+	ctx->state = TB45_SMS_RX_CAPTURE_STATE_IDLE;
+	ctx->last_ret = 0;
+	ctx->active = false;
+	tb45_sms_rx_resume_poll();
 }
 
-static int tb45_sms_rx_startup_cleanup_once(void)
+static void tb45_sms_rx_capture_at_complete(int ret, void *user_data)
 {
+	struct tb45_sms_rx_capture_ctx *ctx = user_data;
+	int submit_ret;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	ctx->last_ret = ret;
+	submit_ret = k_work_submit_to_queue(&low_priority_wq, &ctx->continue_work);
+	if (submit_ret < 0) {
+		if (ctx->state == TB45_SMS_RX_CAPTURE_STATE_CMGL) {
+			atomic_inc(&tb45_sms_rx_scan_fail_count);
+			tb45_sms_rx_publish_notice(0U, (ret < 0) ? ret : submit_ret);
+		}
+		tb45_sms_rx_capture_finish();
+	}
+}
+
+static void tb45_sms_rx_capture_continue_work_handler(struct k_work *work)
+{
+	struct tb45_sms_rx_capture_ctx *ctx = CONTAINER_OF(work, struct tb45_sms_rx_capture_ctx,
+							continue_work);
+	uint16_t indexes[TB45_SMS_RX_SCAN_MAX_INDEXES];
+	size_t index_count;
+	size_t i;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	switch (ctx->state) {
+	case TB45_SMS_RX_CAPTURE_STATE_CMGL:
+		if (ctx->last_ret < 0) {
+			atomic_inc(&tb45_sms_rx_scan_fail_count);
+			tb45_sms_rx_publish_notice(0U, ctx->last_ret);
+			tb45_sms_rx_capture_finish();
+			return;
+		}
+
+		index_count = tb45_sms_parse_cmgl_unread_indexes(tb45_sms_rx_capture_buf,
+			indexes, ARRAY_SIZE(indexes));
+		for (i = 0U; i < index_count; i++) {
+			atomic_inc(&tb45_sms_rx_processed_count);
+			tb45_sms_rx_publish_notice(indexes[i], 0);
+		}
+
+		tb45_sms_rx_capture_finish();
+		return;
+	case TB45_SMS_RX_CAPTURE_STATE_IDLE:
+	default:
+		tb45_sms_rx_capture_finish();
+		return;
+	}
+}
+
+static int tb45_sms_rx_capture_start_cmgl(void)
+{
+	struct tb45_sms_rx_capture_ctx *ctx = &tb45_sms_rx_capture_ctx;
 	int ret;
 
-	if (TB45_SMS_RX_STARTUP_CLEANUP == 0) {
-		return 0;
+	if (ctx->active) {
+		return -EBUSY;
 	}
 
-	if (atomic_get(&tb45_sms_rx_cleanup_done) != 0) {
-		return 0;
-	}
-
-	ret = tb45_sms_at_run(NULL, "AT+CMGD=1,4", "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
+	ctx->state = TB45_SMS_RX_CAPTURE_STATE_CMGL;
+	ctx->last_ret = 0;
+	ret = tb45_sms_at_run_async_capture_cb(NULL, "AT+CMGL=\"REC UNREAD\"", "OK",
+		TB45_SMS_INIT_AT_TIMEOUT_MS, tb45_sms_rx_capture_buf,
+		sizeof(tb45_sms_rx_capture_buf), tb45_sms_rx_capture_at_complete, ctx);
 	if (ret < 0) {
+		ctx->state = TB45_SMS_RX_CAPTURE_STATE_IDLE;
+		atomic_inc(&tb45_sms_rx_scan_fail_count);
 		return ret;
 	}
 
-	atomic_set(&tb45_sms_rx_cleanup_done, 1);
-	LOG_DBG("SMS_RCV startup cleanup completed");
+	ctx->active = true;
 	return 0;
-}
-
-static int tb45_sms_rx_delete_index(uint16_t storage_index)
-{
-	char cmd[24];
-	int ret = snprintf(cmd, sizeof(cmd), "AT+CMGD=%u", storage_index);
-
-	if ((ret < 0) || ((size_t)ret >= sizeof(cmd))) {
-		return -EINVAL;
-	}
-
-	return tb45_sms_at_run(NULL, cmd, "OK", TB45_SMS_INIT_AT_TIMEOUT_MS);
 }
 
 static int tb45_sms_rx_process_index(uint16_t storage_index, char *capture_buf, size_t capture_buf_size)
 {
-	char cmd[24];
-	struct tb45_sms_rx_message message;
-	int ret = snprintf(cmd, sizeof(cmd), "AT+CMGR=%u", storage_index);
+	ARG_UNUSED(capture_buf);
+	ARG_UNUSED(capture_buf_size);
 
-	if ((capture_buf == NULL) || (capture_buf_size == 0U)) {
+	if (storage_index == 0U) {
 		return -EINVAL;
-	}
-
-	if ((ret < 0) || ((size_t)ret >= sizeof(cmd))) {
-		return -EINVAL;
-	}
-
-	ret = tb45_sms_at_exec_capture(cmd, capture_buf, capture_buf_size, TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		atomic_inc(&tb45_sms_rx_cmgr_fail_count);
-		memset(&message, 0, sizeof(message));
-		message.storage_index = storage_index;
-		LOG_DBG("SMS_RCV CMGR idx=%u failed (%d)", storage_index, ret);
-		tb45_sms_event_notify_rx_message(&message, ret);
-		return ret;
-	}
-
-	ret = tb45_sms_parse_cmgr_response(storage_index, capture_buf, &message);
-	if (ret < 0) {
-		atomic_inc(&tb45_sms_rx_parse_fail_count);
-		memset(&message, 0, sizeof(message));
-		message.storage_index = storage_index;
-		LOG_WRN("SMS_RCV parse failed idx=%u (%d)", storage_index, ret);
-		tb45_sms_event_notify_rx_message(&message, ret);
-		return ret;
 	}
 
 	atomic_inc(&tb45_sms_rx_processed_count);
-	tb45_sms_rx_publish_message(&message);
-	tb45_sms_event_notify_rx_message(&message, 0);
-
-	if (TB45_SMS_RX_AUTO_DELETE != 0) {
-		ret = tb45_sms_rx_delete_index(storage_index);
-		if (ret < 0) {
-			atomic_inc(&tb45_sms_rx_delete_fail_count);
-			LOG_WRN("SMS_RCV delete failed idx=%u (%d)", storage_index, ret);
-		}
-	}
-
+	tb45_sms_rx_publish_notice(storage_index, 0);
 	return 0;
 }
 
 static int tb45_sms_rx_scan_unread(char *capture_buf, size_t capture_buf_size)
 {
-	uint16_t indexes[8];
-	size_t count;
-	size_t i;
-	int ret;
+	ARG_UNUSED(capture_buf);
+	ARG_UNUSED(capture_buf_size);
 
-	if ((capture_buf == NULL) || (capture_buf_size == 0U)) {
-		return -EINVAL;
-	}
-
-	ret = tb45_sms_at_exec_capture("AT+CMGL=\"REC UNREAD\"", capture_buf, capture_buf_size,
-				       TB45_SMS_INIT_AT_TIMEOUT_MS);
-	if (ret < 0) {
-		atomic_inc(&tb45_sms_rx_scan_fail_count);
-		return ret;
-	}
-
-	count = tb45_sms_parse_cmgl_unread_indexes(capture_buf, indexes, ARRAY_SIZE(indexes));
-	for (i = 0U; i < count; i++) {
-		(void)tb45_sms_rx_process_index(indexes[i], capture_buf, capture_buf_size);
-	}
-
-	return 0;
+	return tb45_sms_rx_capture_start_cmgl();
 }
 
 static void tb45_sms_rx_process_trigger(const struct tb45_sms_rx_trigger *trigger)
@@ -830,19 +1336,12 @@ static void tb45_sms_rx_process_trigger(const struct tb45_sms_rx_trigger *trigge
 		LOG_DBG("SMS_RCV initialization...please wait");
 	}
 
-	int ret = tb45_sms_rx_configure_once();
-	if (ret < 0) {
-		atomic_inc(&tb45_sms_rx_init_retry_count);
-		LOG_DBG("SMS_RCV setup pending (%d)", ret);
-		tb45_sms_rx_schedule_retry();
-		return;
-	}
-
-	ret = tb45_sms_rx_startup_cleanup_once();
-	if (ret < 0) {
-		atomic_inc(&tb45_sms_rx_init_retry_count);
-		LOG_DBG("SMS_RCV startup cleanup pending (%d)", ret);
-		tb45_sms_rx_schedule_retry();
+	if (!tb45_sms_rx_init_is_ready()) {
+		tb45_sms_rx_init_merge_trigger(trigger);
+		if (!tb45_delayable_retry_is_pending(&tb45_sms_rx_init_ctx.retry)) {
+			tb45_sms_rx_init_ctx.last_ret = 0;
+			(void)tb45_delayable_retry_start(&tb45_sms_rx_init_ctx.retry, 0U);
+		}
 		return;
 	}
 
@@ -878,11 +1377,18 @@ static void tb45_sms_rx_poll_work_handler(struct k_work *work)
 		}
 
 		tb45_sms_rx_process_trigger(&trigger);
+		if (tb45_sms_rx_capture_ctx.active) {
+			break;
+		}
 	}
 
-	int ret = tb45_sms_rx_submit_poll();
-	if ((ret != 0) && (ret != -EAGAIN) && (ret != -EADDRINUSE)) {
-		LOG_ERR("SMS_RCV poll submit failed (%d)", ret);
+	if (tb45_sms_rx_capture_ctx.active) {
+		return;
+	}
+
+	tb45_sms_rx_delete_kick();
+	if (!tb45_delayable_retry_is_pending(&tb45_sms_rx_delete_ctx.retry)) {
+		tb45_sms_rx_resume_poll();
 	}
 }
 
@@ -893,14 +1399,27 @@ static int tb45_sms_rx_init(void)
 	}
 
 	k_work_poll_init(&tb45_sms_rx_poll_work, tb45_sms_rx_poll_work_handler);
-	k_work_init_delayable(&tb45_sms_rx_retry_work, tb45_sms_rx_retry_work_handler);
+	k_work_init(&tb45_sms_rx_init_ctx.continue_work, tb45_sms_rx_init_continue_work_handler);
+	k_work_init(&tb45_sms_rx_capture_ctx.continue_work, tb45_sms_rx_capture_continue_work_handler);
+	tb45_delayable_retry_init(&tb45_sms_rx_init_ctx.retry,
+				      &tb45_sms_rx_init_retry_ops);
+	tb45_delayable_retry_init(&tb45_sms_rx_delete_ctx.retry,
+				      &tb45_sms_rx_delete_retry_ops);
+	tb45_sms_rx_init_ctx.state = TB45_SMS_RX_INIT_STATE_IDLE;
+	tb45_sms_rx_init_ctx.last_ret = 0;
+	tb45_sms_rx_init_ctx.pending_trigger_valid = false;
+	tb45_sms_rx_delete_ctx.storage_index = 0U;
+	tb45_sms_rx_delete_ctx.last_ret = 0;
+	tb45_sms_rx_capture_ctx.state = TB45_SMS_RX_CAPTURE_STATE_IDLE;
+	tb45_sms_rx_capture_ctx.last_ret = 0;
+	tb45_sms_rx_capture_ctx.active = false;
+	atomic_set(&tb45_sms_rx_start_allowed, 0);
 
 	int ret = tb45_sms_rx_submit_poll();
 	if ((ret != 0) && (ret != -EAGAIN)) {
 		LOG_ERR("SMS_RCV init submit failed (%d)", ret);
 	}
 
-	(void)tb45_sms_receive_trigger_scan();
 	return 0;
 }
 
@@ -910,7 +1429,9 @@ int tb45_sms_send(const struct shell *sh, const struct tb45_sms_request *request
 {
 	int ret;
 	int attempt;
+	int max_retries = 0;
 	char cmgs_cmd[48];
+	uint32_t message_id;
 
 	if (request == NULL) {
 		tb45_sms_print_usage(sh);
@@ -933,7 +1454,18 @@ int tb45_sms_send(const struct shell *sh, const struct tb45_sms_request *request
 		return -EINVAL;
 	}
 
-	for (attempt = 0; attempt <= TB45_SMS_SEND_MAX_RETRIES; attempt++) {
+	message_id = request->message_id;
+	if (message_id == 0U) {
+		message_id = tb45_sms_next_request_id();
+	}
+
+#if defined(CONFIG_SHELL)
+	if (sh != NULL) {
+		max_retries = TB45_SMS_SEND_MAX_RETRIES;
+	}
+#endif
+
+	for (attempt = 0; attempt <= max_retries; attempt++) {
 #if defined(CONFIG_SHELL)
 		if ((sh != NULL) && tb45_sms_send_cancel_pending(sh)) {
 			shell_warn(sh, "SMS send canceled by Ctrl+C");
@@ -943,6 +1475,12 @@ int tb45_sms_send(const struct shell *sh, const struct tb45_sms_request *request
 		ret = tb45_sms_at_send_text_raw(sh, cmgs_cmd, request->message,
 						TB45_SMS_SEND_ATTEMPT_TIMEOUT_MS);
 		if (ret == 0) {
+#if defined(CONFIG_SHELL)
+			if (sh != NULL) {
+				shell_print(sh, "[SMS_SND] send_ok id=%u phone=%s", message_id,
+					    request->phone_number);
+			}
+#endif
 			return 0;
 		}
 
@@ -955,34 +1493,26 @@ int tb45_sms_send(const struct shell *sh, const struct tb45_sms_request *request
 
 		if (sh != NULL) {
 #if defined(CONFIG_SHELL)
-			if (attempt < TB45_SMS_SEND_MAX_RETRIES) {
+			if (attempt < max_retries) {
 				shell_error(sh, "SMS send failed (%d), retry %d/%d", ret, attempt + 1,
-						    TB45_SMS_SEND_MAX_RETRIES);
+						    max_retries);
 			} else {
-				shell_error(sh, "SMS send failed (%d), retries exhausted", ret);
+				shell_error(sh, "[SMS_SND] send_fail id=%u rc=%d phone=%s", message_id,
+				    ret, request->phone_number);
 			}
 #else
-			if (attempt < TB45_SMS_SEND_MAX_RETRIES) {
-				LOG_ERR("SMS send failed (%d), retry %d/%d", ret, attempt + 1,
-					TB45_SMS_SEND_MAX_RETRIES);
-			} else {
-				LOG_ERR("SMS send failed (%d), retries exhausted", ret);
-			}
+			LOG_ERR("SMS send failed (%d)", ret);
 #endif
 		}
 
-		if (attempt < TB45_SMS_SEND_MAX_RETRIES) {
 #if defined(CONFIG_SHELL)
-			if ((sh != NULL) &&
-			    (tb45_sms_send_sleep_interruptible(sh, TB45_SMS_SEND_RETRY_DELAY_MS) ==
-			     -ECANCELED)) {
-				shell_warn(sh, "SMS send canceled by Ctrl+C");
-				return -ECANCELED;
-			}
-#else
-			k_msleep(TB45_SMS_SEND_RETRY_DELAY_MS);
-#endif
+		if ((attempt < max_retries) &&
+		    (tb45_sms_send_sleep_interruptible(sh, TB45_SMS_SEND_RETRY_DELAY_MS) ==
+		     -ECANCELED)) {
+			shell_warn(sh, "SMS send canceled by Ctrl+C");
+			return -ECANCELED;
 		}
+#endif
 	}
 
 	return ret;
@@ -991,7 +1521,8 @@ int tb45_sms_send(const struct shell *sh, const struct tb45_sms_request *request
 int tb45_sms_send_enqueue(const struct tb45_sms_request *request)
 {
 	struct tb45_async_job job;
-	int ret = tb45_sms_build_enqueue_job(&job, request, 0U, NULL);
+	int ret = tb45_sms_build_enqueue_job(&job, TB45_ASYNC_JOB_TYPE_SMS_SEND,
+					     request, NULL);
 	if (ret < 0) {
 		return ret;
 	}
@@ -1021,32 +1552,39 @@ int tb45_sms_send_enqueue_with_result_id(const struct tb45_sms_request *request)
 	int ret;
 
 	if ((request == NULL) || (request->message_id == 0U)) {
-		tb45_sms_event_notify_enqueue(request, -EINVAL);
 		return -EINVAL;
 	}
 
-	ret = tb45_sms_build_enqueue_job(&job, request, 1U, NULL);
+	ret = tb45_sms_build_enqueue_job(&job, TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT,
+					 request, NULL);
 	if (ret < 0) {
-		tb45_sms_event_notify_enqueue(request, ret);
+		LOG_ERR("[SMS_ENQUEUE] enqueue_build_fail id=%u rc=%d phone=%s",
+			request->message_id, ret, request->phone_number);
 		return ret;
 	}
 
 	ret = tb45_async_job_enqueue(&job);
-	tb45_sms_event_notify_enqueue(request, ret);
+	if (ret == 0) {
+		LOG_DBG("[SMS_ENQUEUE] enqueue_ok id=%u phone=%s", request->message_id,
+			request->phone_number);
+	} else {
+		LOG_ERR("[SMS_ENQUEUE] enqueue_fail id=%u rc=%d phone=%s",
+			request->message_id, ret, request->phone_number);
+	}
+
 	return ret;
 }
 
 int tb45_sms_send_enqueue_wait(const struct tb45_sms_request *request)
 {
 	struct tb45_async_job job;
-	struct tb45_sms_wait_ctx wait_ctx = {
-		.result = -EINPROGRESS,
-	};
+	struct tb45_async_wait_ctx wait_ctx;
 	int ret;
 
-	k_sem_init(&wait_ctx.done, 0, 1);
+	tb45_async_wait_ctx_init(&wait_ctx, -EINPROGRESS);
 
-	ret = tb45_sms_build_enqueue_job(&job, request, 0U, &wait_ctx);
+	ret = tb45_sms_build_enqueue_job(&job, TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT,
+					 request, &wait_ctx);
 	if (ret < 0) {
 		return ret;
 	}
@@ -1137,6 +1675,11 @@ int tb45_sms_receive_trigger_scan(void)
 	return tb45_sms_rx_enqueue_trigger(0U, 1U);
 }
 
+int tb45_sms_receive_recover_stored_unread_messages(void)
+{
+	return tb45_sms_receive_trigger_scan();
+}
+
 int tb45_sms_receive_trigger_index(uint16_t storage_index)
 {
 	if (storage_index == 0U) {
@@ -1146,21 +1689,91 @@ int tb45_sms_receive_trigger_index(uint16_t storage_index)
 	return tb45_sms_rx_enqueue_trigger(storage_index, 0U);
 }
 
+int tb45_sms_receive_prepare_for_modem_reconnect(void)
+{
+	atomic_set(&tb45_sms_rx_start_allowed, 0);
+	tb45_sms_rx_reset_runtime_state();
+	return 0;
+}
+
 int tb45_sms_receive_recover_after_modem_reconnect(void)
 {
-	atomic_set(&tb45_sms_rx_setup_done, 0);
-	atomic_set(&tb45_sms_rx_init_wait_logged, 0);
-	atomic_set(&tb45_sms_rx_init_completed_logged, 0);
+	tb45_sms_rx_reset_runtime_state();
+	atomic_set(&tb45_sms_rx_start_allowed, 1);
 	return tb45_sms_receive_trigger_scan();
+}
+
+int tb45_sms_receive_notice_wait(struct tb45_sms_rx_notice *out_notice, k_timeout_t timeout)
+{
+	if (out_notice == NULL) {
+		return -EINVAL;
+	}
+
+	return k_msgq_get(&tb45_sms_rx_result_msgq, out_notice, timeout);
+}
+
+int tb45_sms_receive_read_index(uint16_t storage_index, struct tb45_sms_rx_message *out_message)
+{
+	char cmd[24];
+	char response[TB45_SMS_RX_CAPTURE_BUF_SIZE];
+	int ret;
+
+	if ((storage_index == 0U) || (out_message == NULL)) {
+		return -EINVAL;
+	}
+
+	ret = snprintf(cmd, sizeof(cmd), "AT+CMGR=%u", storage_index);
+	if ((ret < 0) || ((size_t)ret >= sizeof(cmd))) {
+		return -EINVAL;
+	}
+
+	ret = tb45_sms_at_exec_capture(cmd, response, sizeof(response), TB45_SMS_INIT_AT_TIMEOUT_MS);
+	if (ret < 0) {
+		atomic_inc(&tb45_sms_rx_cmgr_fail_count);
+		LOG_DBG("SMS_RCV CMGR idx=%u failed (%d)", storage_index, ret);
+		return ret;
+	}
+
+	ret = tb45_sms_parse_cmgr_response(storage_index, response, out_message);
+	if (ret < 0) {
+		atomic_inc(&tb45_sms_rx_parse_fail_count);
+		LOG_WRN("SMS_RCV parse failed idx=%u (%d)", storage_index, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+int tb45_sms_receive_delete_index(uint16_t storage_index)
+{
+	if (storage_index == 0U) {
+		return -EINVAL;
+	}
+
+	return tb45_sms_rx_enqueue_delete(storage_index);
 }
 
 int tb45_sms_receive_wait(struct tb45_sms_rx_message *out_message, k_timeout_t timeout)
 {
+	struct tb45_sms_rx_notice notice;
+	int ret;
+
 	if (out_message == NULL) {
 		return -EINVAL;
 	}
 
-	return k_msgq_get(&tb45_sms_rx_result_msgq, out_message, timeout);
+	ret = tb45_sms_receive_notice_wait(&notice, timeout);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (notice.status < 0) {
+		memset(out_message, 0, sizeof(*out_message));
+		out_message->storage_index = notice.storage_index;
+		return notice.status;
+	}
+
+	return tb45_sms_receive_read_index(notice.storage_index, out_message);
 }
 
 int tb45_sms_get_stats(struct tb45_sms_stats *out_stats)

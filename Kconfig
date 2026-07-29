@@ -1,5 +1,24 @@
 menu "TB45 Application Options"
 
+config APP_TB45_MODEM_AT_USER_PIPE
+	bool "Enable TB45 modem AT user pipe"
+	default y
+	depends on $(dt_alias_enabled,modem)
+	select MODEM_CHAT
+	select MODEM_PIPE
+	select MODEM_PIPELINK
+	help
+	  Enable the TB45-owned implementation of the modem AT user pipe.
+	  This replaces Zephyr's generic MODEM_AT_USER_PIPE implementation so
+	  the user-pipe behavior can be maintained with the TB45 application.
+
+config APP_TB45_MODEM_AT_USER_PIPE_IDX
+	int "TB45 modem AT user pipe number"
+	default 0
+	depends on APP_TB45_MODEM_AT_USER_PIPE
+	help
+	  User pipe number used by the TB45 modem AT user pipe implementation.
+
 config TIBBIT_45
     bool "Enable Tibbit 45 library"
     default y
@@ -52,6 +71,16 @@ config APP_TB45_MODEM_BRINGUP_MAX_RETRIES
       Set to 0 for infinite retries.
       This maps to CONFIG_MODEM_CELLULAR_BRINGUP_MAX_RETRIES behavior.
 
+config APP_TB45_MODEM_CARRIER_AUTO_FALLBACK_RETRIES
+    int "Manual carrier retries before automatic operator fallback"
+    default 3
+    range 0 10000
+    help
+      Number of registration-related bring-up failures allowed while using
+      a manually configured carrier_id before switching to automatic operator
+      selection. The global bring-up retry counter continues counting.
+      Set to 0 to disable this fallback.
+
 config APP_TB45_MODEM_NEW_BAUDRATE
     int "Custom modem new baudrate (out-of-tree modem driver)"
     default 115200
@@ -62,7 +91,7 @@ config APP_TB45_MODEM_NEW_BAUDRATE
 
 config APP_TB45_MODEM_UART_BUFFER_SIZES
     int "Custom modem UART RX/TX buffer size (out-of-tree modem driver)"
-    default 512
+    default 128
     range 64 4096
     help
       UART backend receive/transmit buffer size used by the custom modem driver.
@@ -78,11 +107,30 @@ config APP_TB45_MODEM_CHAT_BUFFER_SIZE
 
 config APP_TB45_MODEM_USER_PIPE_BUFFER_SIZES
     int "Custom modem user pipe buffer size (out-of-tree modem driver)"
-    default 128
+    default 256
     range 32 1024
     help
       User pipe receive buffer size used by the custom modem driver.
       This maps to CONFIG_MODEM_CELLULAR_USER_PIPE_BUFFER_SIZES behavior.
+
+config APP_TB45_MODEM_PPP_DLCI_RX_BUF_EXTRA
+    int "Extra PPP DLCI receive buffer size (out-of-tree modem driver)"
+    default 512
+    range 0 4096
+    help
+      Extra receive-buffer bytes reserved only for the PPP CMUX DLCI.
+      This allows CONFIG_MODEM_CMUX_WORK_BUFFER_SIZE_EXTRA to remain 0
+      without removing the existing PPP-specific receive headroom.
+
+config APP_TB45_MODEM_DLCI2_RX_BUF_EXTRA
+    int "Extra DLCI 2 receive buffer size (out-of-tree modem driver)"
+    default 128
+    range 0 4096
+    help
+      Extra receive-buffer bytes reserved only for CMUX DLCI 2 command/control
+      traffic and modem URC bursts. This allows
+      CONFIG_MODEM_CMUX_WORK_BUFFER_SIZE_EXTRA to remain 0 while providing
+      DLCI 2 with additional burst headroom.
 
 config APP_TB45_MODEM_INIT_PRIORITY
     int "Custom modem init priority (out-of-tree modem driver)"
@@ -116,6 +164,16 @@ config APP_TB45_MODEM_PERIODIC_SCRIPT_MS
       Periodic script interval used by modem bring-up/health checks.
       This maps to CONFIG_MODEM_CELLULAR_PERIODIC_SCRIPT_MS behavior.
 
+config APP_TB45_MODEM_NETWORK_MODE_OVERRIDE
+    int "Custom modem CNMP network mode override (-1 to use autodetect)"
+    default -1
+    range -1 255
+    help
+      Controls the SIM7080 network mode setup done with AT+CNMP=<code>.
+      Set to -1 to keep the existing autodetect/priority scan behavior.
+      Set to a CNMP code such as 2, 13, or 38 to skip the scan and force
+      that exact mode once during modem bring-up.
+
 config APP_TB45_PING_COUNT_DEFAULT
     int "Default ping count for tb45 net ping"
     default 4
@@ -125,7 +183,7 @@ config APP_TB45_PING_COUNT_DEFAULT
 
 config APP_TB45_ASYNC_JOB_QUEUE_DEPTH
     int "TB45 async job queue depth"
-    default 4
+    default 2
     range 1 32
     help
       Number of jobs buffered by the shared TB45 async queue (SMS + PING).
@@ -143,20 +201,6 @@ config APP_TB45_ASYNC_JOB_PRIORITY
     range -16 15
     help
       Zephyr thread priority for the shared TB45 async worker thread.
-
-config APP_TB45_ASYNC_SMS_JOB_EXTRA_RETRIES
-    int "Extra retries for async SMS jobs"
-    default 0
-    range 0 5
-    help
-      Additional dispatcher-level retries after the first SMS job attempt.
-
-config APP_TB45_ASYNC_SMS_JOB_RETRY_DELAY_MS
-    int "Retry delay for async SMS jobs (ms)"
-    default 1000
-    range 0 60000
-    help
-      Delay between dispatcher-level SMS job retry attempts.
 
 config APP_TB45_ASYNC_PING_JOB_EXTRA_RETRIES
     int "Extra retries for async PING jobs"
@@ -231,6 +275,15 @@ config APP_TB45_PPP_PERIODIC_PROBE_INTERVAL_MS
       reachability check.
       Set to 0 to disable periodic checks.
 
+config APP_TB45_PPP_PROBE_ENABLE
+    bool "Enable PPP periodic probe feature"
+    default y
+    help
+      Build the TB45 PPP periodic probe feature.
+      When enabled, the periodic probe workers, probe shell commands, and
+      probe status reporting are compiled in.
+      When disabled, the probe feature is compiled out to save flash and RAM.
+
 config APP_TB45_PPP_PERIODIC_RECOVERY_COOLDOWN_MS
     int "Cooldown before periodic PPP health can trigger another recovery (ms)"
     default 60000
@@ -238,6 +291,14 @@ config APP_TB45_PPP_PERIODIC_RECOVERY_COOLDOWN_MS
     help
       Minimum time between consecutive periodic health-triggered recoveries.
       Set to 0 to allow immediate retriggering on repeated failures.
+
+config APP_TB45_SMS_ENABLE
+	bool "Enable TB45 SMS feature"
+	default y
+	help
+	  Build and enable SMS send/receive support, SMS event handling,
+	  modem SMS URC handling, SMS shell commands, and the application SMS tests.
+	  Set this to n to remove SMS functionality from the build.
 
 config APP_TB45_SMS_TEXT_MAX_LEN
     int "Maximum SMS text length"
@@ -264,7 +325,7 @@ config APP_TB45_SMS_SEND_ATTEMPT_TIMEOUT_MS
 
 config APP_TB45_SMS_SEND_MAX_RETRIES
     int "Maximum retries for SMS send"
-    default 3
+    default 0
     range 0 20
     help
       Number of retries after a failed send attempt.
@@ -293,7 +354,7 @@ config APP_TB45_SMS_INIT_AT_TIMEOUT_MS
 
 config APP_TB45_SMS_RESULT_QUEUE_DEPTH
     int "SMS async result queue depth"
-    default 16
+    default 4
     range 1 128
     help
       Number of completed SMS results buffered for later retrieval by
@@ -307,7 +368,7 @@ config APP_TB45_SMS_TRIGGER_EVENT_PATH
 
 config APP_TB45_SMS_EVENT_QUEUE_DEPTH
     int "SMS event queue depth"
-    default 16
+    default 4
     range 1 128
     help
       Number of SMS events buffered before callback dispatch.
@@ -358,31 +419,27 @@ config APP_TB45_SMS_RESULT_WORKER_PRIORITY
 
 config APP_TB45_SMS_RX_TRIGGER_QUEUE_DEPTH
     int "SMS receive trigger queue depth"
-    default 8
+    default 4
     range 1 64
     help
       Number of pending SMS receive triggers buffered from serial/CMTI events.
 
+config APP_TB45_SMS_RX_SCAN_MAX_INDEXES
+    int "Maximum SMS indexes parsed per unread scan"
+    default 8
+    range 1 64
+    help
+      Maximum number of modem storage indexes parsed from one
+      AT+CMGL="REC UNREAD" scan. One receive event is published per
+      parsed index in modem-returned order. This uses 2 bytes of stack per
+      configured slot during scan handling and does not allocate persistent RAM.
+
 config APP_TB45_SMS_RX_RESULT_QUEUE_DEPTH
     int "SMS receive result queue depth"
-    default 16
+    default 1
     range 1 128
     help
       Number of parsed inbound SMS messages buffered for tb45_sms_receive_wait().
-
-config APP_TB45_SMS_RX_WORKER_STACK_SIZE
-    int "SMS receive worker stack size"
-    default 3072
-    range 1024 8192
-    help
-      Stack size for SMS receive worker thread.
-
-config APP_TB45_SMS_RX_WORKER_PRIORITY
-    int "SMS receive worker priority"
-    default 8
-    range -16 15
-    help
-      Priority for SMS receive worker thread.
 
 config APP_TB45_SMS_RX_STORAGE
     string "SMS receive storage memory (ME or SM)"

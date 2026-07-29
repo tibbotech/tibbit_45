@@ -27,8 +27,14 @@ struct tb45_ping_progress {
 
 typedef void (*tb45_ping_progress_cb_t)(const struct tb45_ping_progress *progress,
 					void *user_data);
+typedef bool (*tb45_ping_cancel_cb_t)(void *user_data);
+typedef void (*tb45_ping_complete_cb_t)(int ret, void *user_data);
 
 int tb45_ping_enqueue(const char *host, uint16_t count, uint32_t timeout_ms);
+int tb45_ping_enqueue_ex(const char *host, uint16_t count, uint32_t timeout_ms,
+			 size_t payload_size, tb45_ping_progress_cb_t progress_cb,
+			 tb45_ping_complete_cb_t complete_cb, void *progress_user_data,
+			 void *complete_user_data);
 /**
  * @brief Queue ping execution on async worker and wait for final result.
  *
@@ -40,6 +46,10 @@ int tb45_ping_run(const char *host, uint16_t count, uint32_t timeout_ms);
 int tb45_ping_run_ex(const char *host, uint16_t count, uint32_t timeout_ms,
 		     size_t payload_size, tb45_ping_progress_cb_t progress_cb,
 		     void *progress_user_data);
+int tb45_ping_run_ex_cancelable(const char *host, uint16_t count, uint32_t timeout_ms,
+				size_t payload_size, tb45_ping_progress_cb_t progress_cb,
+				tb45_ping_cancel_cb_t cancel_cb, void *progress_user_data,
+				void *cancel_user_data);
 
 #ifdef __cplusplus
 }

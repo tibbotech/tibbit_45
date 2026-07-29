@@ -1,4 +1,4 @@
-#include "tb45_async_job.h"
+#include "tb45_async_job_internal.h"
 
 #include <errno.h>
 
@@ -8,20 +8,23 @@
 LOG_MODULE_REGISTER(tb45_async_job, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define TB45_ASYNC_JOB_QUEUE_DEPTH  CONFIG_APP_TB45_ASYNC_JOB_QUEUE_DEPTH
-struct tb45_async_job_policy {
-	uint8_t max_attempts;
-	uint32_t retry_delay_ms;
-};
 
 K_MSGQ_DEFINE(tb45_async_job_msgq, sizeof(struct tb45_async_job), TB45_ASYNC_JOB_QUEUE_DEPTH, 4);
 
-static tb45_async_job_handler_t tb45_async_handlers[TB45_ASYNC_JOB_TYPE_COUNT];
+static tb45_async_job_handler_t tb45_async_handlers[TB45_ASYNC_JOB_TYPE_COUNT] = {0};
+static tb45_async_job_complete_cb_t tb45_async_complete_cbs[TB45_ASYNC_JOB_TYPE_COUNT] = {0};
 
 static const char *tb45_async_job_type_name(enum tb45_async_job_type type)
 {
 	switch (type) {
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
 	case TB45_ASYNC_JOB_TYPE_SMS_SEND:
 		return "SMS_SEND";
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT:
+		return "SMS_SEND_CAPTURE_RESULT";
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT:
+		return "SMS_SEND_WAIT";
+#endif
 	case TB45_ASYNC_JOB_TYPE_PING_RUN:
 		return "PING_RUN";
 	default:
@@ -29,21 +32,22 @@ static const char *tb45_async_job_type_name(enum tb45_async_job_type type)
 	}
 }
 
-static struct tb45_async_job_policy tb45_async_job_policy_get(enum tb45_async_job_type type)
+struct tb45_async_job_policy tb45_async_job_policy_get(enum tb45_async_job_type type)
 {
 	struct tb45_async_job_policy policy = {
 		.max_attempts = 1U,
-		.retry_delay_ms = 0U,
 	};
 
 	switch (type) {
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
 	case TB45_ASYNC_JOB_TYPE_SMS_SEND:
-		policy.max_attempts = (uint8_t)(1U + CONFIG_APP_TB45_ASYNC_SMS_JOB_EXTRA_RETRIES);
-		policy.retry_delay_ms = CONFIG_APP_TB45_ASYNC_SMS_JOB_RETRY_DELAY_MS;
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT:
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT:
+		policy.max_attempts = (uint8_t)(1U + CONFIG_APP_TB45_SMS_SEND_MAX_RETRIES);
 		break;
+#endif
 	case TB45_ASYNC_JOB_TYPE_PING_RUN:
 		policy.max_attempts = (uint8_t)(1U + CONFIG_APP_TB45_ASYNC_PING_JOB_EXTRA_RETRIES);
-		policy.retry_delay_ms = CONFIG_APP_TB45_ASYNC_PING_JOB_RETRY_DELAY_MS;
 		break;
 	default:
 		break;
@@ -54,6 +58,22 @@ static struct tb45_async_job_policy tb45_async_job_policy_get(enum tb45_async_jo
 	}
 
 	return policy;
+}
+
+uint32_t tb45_async_job_retry_delay_ms(enum tb45_async_job_type type)
+{
+	switch (type) {
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND:
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_CAPTURE_RESULT:
+	case TB45_ASYNC_JOB_TYPE_SMS_SEND_WAIT:
+		return CONFIG_APP_TB45_SMS_SEND_RETRY_DELAY_MS;
+#endif
+	case TB45_ASYNC_JOB_TYPE_PING_RUN:
+		return CONFIG_APP_TB45_ASYNC_PING_JOB_RETRY_DELAY_MS;
+	default:
+		return 0U;
+	}
 }
 
 int tb45_async_job_execute(const struct tb45_async_job *job)
@@ -69,37 +89,43 @@ int tb45_async_job_execute(const struct tb45_async_job *job)
 		return -ENODEV;
 	}
 
-	struct tb45_async_job_policy policy = tb45_async_job_policy_get(job->type);
-	int ret = -EIO;
-
-	for (uint8_t attempt = 1U; attempt <= policy.max_attempts; attempt++) {
-		ret = handler(job);
-		if (ret == 0) {
-			return 0;
-		}
-
-		LOG_WRN("async job %s failed (%d), attempt %u/%u",
-			tb45_async_job_type_name(job->type), ret,
-			attempt, policy.max_attempts);
-
-		if ((attempt < policy.max_attempts) && (policy.retry_delay_ms > 0U)) {
-			k_msleep(policy.retry_delay_ms);
-		}
-	}
-
-	return ret;
+	return handler(job);
 }
 
 int tb45_async_job_register_handler(enum tb45_async_job_type type,
-				    tb45_async_job_handler_t handler)
+				    tb45_async_job_handler_t handler,
+				    tb45_async_job_complete_cb_t complete_cb)
 {
 	if (((unsigned int)type >= TB45_ASYNC_JOB_TYPE_COUNT) || (handler == NULL)) {
 		return -EINVAL;
 	}
 
 	tb45_async_handlers[type] = handler;
+	tb45_async_complete_cbs[type] = complete_cb;
 	LOG_INF("async handler registered for %s", tb45_async_job_type_name(type));
 	return 0;
+}
+
+void tb45_async_job_complete(const struct tb45_async_job *job, int ret)
+{
+	if ((job == NULL) || ((unsigned int)job->type >= TB45_ASYNC_JOB_TYPE_COUNT)) {
+		return;
+	}
+
+	tb45_async_job_complete_cb_t complete_cb = tb45_async_complete_cbs[job->type];
+	if (complete_cb != NULL) {
+		complete_cb(job, ret);
+	}
+}
+
+void tb45_async_job_complete_wait_ctx(struct tb45_async_wait_ctx *wait_ctx, int ret)
+{
+	if (wait_ctx == NULL) {
+		return;
+	}
+
+	wait_ctx->result = ret;
+	k_sem_give(&wait_ctx->done);
 }
 
 int tb45_async_job_enqueue(const struct tb45_async_job *job)
