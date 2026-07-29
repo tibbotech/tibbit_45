@@ -30,6 +30,11 @@ struct tb45_sms_rx_message {
 	char message[CONFIG_APP_TB45_SMS_TEXT_MAX_LEN + 1];
 };
 
+struct tb45_sms_rx_notice {
+	uint16_t storage_index;
+	int status;
+};
+
 struct tb45_sms_stats {
 	uint32_t rx_setup_done;
 	uint32_t rx_cleanup_done;
@@ -133,23 +138,46 @@ int tb45_sms_send_global(const struct tb45_sms_request *request);
 /**
  * @brief Trigger SMS receive scan from modem storage.
  *
- * This is non-blocking. The receive worker will fetch unread messages and
- * queue parsed results for tb45_sms_receive_wait() and event callbacks.
+ * This is non-blocking. The receive worker queues receive notices by modem
+ * storage index; callers read message bodies explicitly when needed.
  *
  * @return 0 when trigger accepted, negative error code otherwise.
  */
 int tb45_sms_receive_trigger_scan(void);
 
 /**
+ * @brief Trigger manual recovery scan for unread SMS already stored in modem memory.
+ *
+ * This is a convenience wrapper for app-side callers that want to re-check
+ * local modem storage after a reboot or on a manual action such as a button
+ * press. The scan is non-blocking and reuses the normal SMS receive worker
+ * path. It does not retrieve SMS that is still pending upstream in the
+ * network/SMSC.
+ *
+ * @return 0 when trigger accepted, negative error code otherwise.
+ */
+int tb45_sms_receive_recover_stored_unread_messages(void);
+
+/**
  * @brief Trigger SMS receive for one known modem storage index.
  *
- * This is non-blocking. The receive worker will run `AT+CMGR=<index>` and
- * process the message if present.
+ * This is non-blocking. The receive worker queues a receive notice for this
+ * modem storage index; callers read the body explicitly when needed.
  *
  * @param storage_index Modem storage index from `+CMTI`.
  * @return 0 when trigger accepted, negative error code otherwise.
  */
 int tb45_sms_receive_trigger_index(uint16_t storage_index);
+
+/**
+ * @brief Reset SMS receive state while modem reconnect is still in progress.
+ *
+ * This clears one-time RX setup state and pauses new receive triggers until
+ * PPP-ready post actions explicitly re-arm SMS receive.
+ *
+ * @return 0 on success.
+ */
+int tb45_sms_receive_prepare_for_modem_reconnect(void);
 
 /**
  * @brief Re-arm SMS receive configuration after modem reconnect.
@@ -163,7 +191,33 @@ int tb45_sms_receive_trigger_index(uint16_t storage_index);
 int tb45_sms_receive_recover_after_modem_reconnect(void);
 
 /**
- * @brief Wait for next received SMS message.
+ * @brief Wait for next received SMS notice.
+ *
+ * @param out_notice Output receive notice with modem storage index and status.
+ * @param timeout Wait timeout.
+ * @return 0 on success, -EAGAIN on timeout, negative error code otherwise.
+ */
+int tb45_sms_receive_notice_wait(struct tb45_sms_rx_notice *out_notice, k_timeout_t timeout);
+
+/**
+ * @brief Read one received SMS from modem storage.
+ *
+ * @param storage_index Modem storage index from a receive notice/event.
+ * @param out_message Output parsed message.
+ * @return 0 on success, negative error code on failure.
+ */
+int tb45_sms_receive_read_index(uint16_t storage_index, struct tb45_sms_rx_message *out_message);
+
+/**
+ * @brief Queue deletion of one SMS from modem storage.
+ *
+ * @param storage_index Modem storage index to delete.
+ * @return 0 when delete request accepted, negative error code otherwise.
+ */
+int tb45_sms_receive_delete_index(uint16_t storage_index);
+
+/**
+ * @brief Wait for next received SMS message and read its body from modem storage.
  *
  * @param out_message Output receive message.
  * @param timeout Wait timeout.
